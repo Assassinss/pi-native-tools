@@ -106,8 +106,10 @@ The edit tool supports **two edit modes** in a single call:
 
 | Mode | Field | Use Case |
 |------|-------|----------|
-| **Text-based** | `{ oldText, newText }` | Exact text match replacement (like built-in) |
+| **Text-based** | `{ oldText, newText }` | Exact text match replacement (compatibility mode) |
 | **Hashline-anchored** | `{ hashline, newText }` | Position-verified replacement using LINE:HASH |
+
+Hashline-anchored edits are the primary safety mechanism. For batched hashline edits, the tool first verifies every anchor against the original file snapshot, then applies the resulting changes in one pass. This keeps a single read snapshot valid even when earlier edits insert lines or replace a line with multiple lines.
 
 ### Hashline Mechanism
 
@@ -118,10 +120,11 @@ Workflow:
 2. Edit file with edit(hashline="42:a1b2c3d4", newText="const x = 2;")
    → Tool reads file, computes SHA256 of line 42
    → Verifies it matches "a1b2c3d4"
-   → Only then replaces the line
+   → Batches all verified hashline edits against that original snapshot
+   → Only then applies the final replacements/insertions
 ```
 
-**Why this matters:** Without hashline verification, if the file has shifted since the read (e.g., lines were added/deleted above), the edit could land on the wrong line. Hashline anchoring prevents this by cryptographically verifying line identity before applying changes.
+**Why this matters:** Without hashline verification, if the file has shifted since the read (e.g., lines were added/deleted above), the edit could land on the wrong line. Hashline anchoring prevents this by cryptographically verifying line identity before applying changes. Batched verification against the original snapshot also means one edit in the batch cannot silently invalidate the anchors for the later edits.
 
 ### Edit Schema
 
@@ -130,9 +133,9 @@ Workflow:
   path: string;
   edits: Array<{
     oldText?: string;    // exact text match (mutually exclusive with hashline)
-    newText: string;     // replacement text
-    hashline?: string;   // "LINE:HEX" anchor (mutually exclusive with oldText)
-    wholeLine?: boolean; // default true: replace entire line
+    newText: string;     // replacement text, may be multi-line
+    hashline?: string;   // "LINE:SHORT_HASH" anchor (mutually exclusive with oldText)
+    wholeLine?: boolean; // default true: replace entire line; false inserts after anchor
   }>;
 }
 ```
@@ -160,9 +163,11 @@ Uses `withFileMutationQueue()` to participate in Pi's per-file mutation queue. T
 
 ```typescript
 return withFileMutationQueue(absolutePath, async () => {
-  // read → modify → write all happen atomically per file
+  // read → verify/apply edits → write all happen atomically per file
   const content = await readFile(absolutePath, "utf-8");
-  const newContent = applyTextEdits(content, textEdits, path);
+  let newContent = content;
+  if (textEdits.length > 0) newContent = applyTextEdits(newContent, textEdits, path);
+  if (hashlineEdits.length > 0) newContent = applyHashlineEdits(newContent, hashlineEdits, path);
   await fsWriteFile(absolutePath, newContent, "utf-8");
   // return diff...
 });
@@ -174,7 +179,8 @@ return withFileMutationQueue(absolutePath, async () => {
 - Rejects edits with neither (must specify one mode)
 - Rejects empty `edits` array
 - For text edits: ensures `oldText` is unique in the file
-- For hashline edits: verifies line exists, hash matches, and no duplicate line targeting
+- For hashline edits: requires `LINE:SHORT_HASH` format, verifies the line exists, verifies the hash matches, and rejects duplicate line targeting
+- For batched hashline edits: verifies all anchors against the original snapshot before applying any insertions or multi-line replacements
 - Handles legacy session format (flat `oldText`/`newText` from old sessions, JSON string `edits`)
 
 ## 3. Write Tool — Streaming Writes with Verification
@@ -268,7 +274,7 @@ All three tools use structured error handling:
 | Operation aborted | `signal.aborted` check | `Operation aborted` |
 | Edit oldText not found | `indexOf` returns -1 | `Edit failed: oldText not found in path` |
 | Edit not unique | `indexOf` finds 2+ occurrences | `Edit failed: oldText appears multiple times` |
-| Hashline parse error | Regex mismatch | `invalid hashline format` |
+| Hashline parse error | Regex mismatch / wrong short hash length | `invalid hashline format` |
 | Hashline line out of range | Index check | `references line X, but file has only Y lines` |
 | Hashline hash mismatch | SHA256 verification | `hash mismatch at line X. Expected: ..., actual: ...` |
 
@@ -277,9 +283,9 @@ All three tools use structured error handling:
 The implementation now uses a package-friendly multi-file structure:
 
 - `index.ts` - root extension entry for `pi install /path/to/package`
-- `extensions/shared.ts` - shared helpers, constants, path handling, hashing
+- `extensions/shared.ts` - shared helpers, constants, path handling, hashing, and shared line splitting/joining helpers
 - `extensions/read.ts` - read tool registration and streaming read logic
-- `extensions/edit.ts` - edit tool registration and hashline edit logic
+- `extensions/edit.ts` - edit tool registration and snapshot-verified hashline edit logic
 - `extensions/write.ts` - write tool registration and streaming write logic
 - `.pi/extensions/custom-tools.ts` - thin compatibility wrapper that re-exports `../../index`
 
@@ -308,10 +314,9 @@ npm test
 
 Coverage includes:
 
-- `tests/entry.test.ts` - extension entry registers `read`, `edit`, `write`
-- `tests/unit.test.ts` - hashline parsing/verification, diff generation, edit validation, small/large file read/write execution
-- `tests/integration.test.ts` - end-to-end tool execution through the real extension entry and registered tool definitions
-- `tests/cli-smoke.test.ts` - Pi CLI can load the package entry successfully
+- `tests/entry.test.ts` - extension entry registers `read`, `edit`, `write`, and the `session_start` hook
+- `tests/unit.test.ts` - hashline parsing/verification, snapshot-based hashline application, multi-line replacement/insertion, trailing empty-line anchors, diff generation, edit validation, and small/large file read/write execution
+- `tests/integration.test.ts` - end-to-end tool execution through the real extension entry and registered tool definitions, including batched hashline edits from one read snapshot
 
 ## Requirements Audit
 
@@ -320,9 +325,9 @@ Coverage includes:
 | **Read: high-performance** | ✅ | Streaming reads for >5MB files |
 | **Read: offset/limit** | ✅ | 1-indexed line range |
 | **Read: hashline output** | ✅ | `LINE:HASH|content` with SHA256 |
-| **Edit: hashline mechanism** | ✅ | SHA256 per-line verification |
+| **Edit: hashline mechanism** | ✅ | SHA256 per-line verification against the original snapshot |
 | **Edit: diff visualization** | ✅ | Returns `{diff, patch, firstChangedLine}` for Pi's built-in diff renderer |
-| **Edit: precise positioning** | ✅ | Hashline prevents edit misalignment |
+| **Edit: precise positioning** | ✅ | Hashline prevents edit misalignment, even across batched insertions and multi-line edits |
 | **Write: large file support** | ✅ | Streaming writes with drain backpressure |
 | **Write: no OOM** | ✅ | 64KB chunks, stream-based |
 | **Write: verification** | ✅ | File size + SHA256 hash after write |
