@@ -19,6 +19,7 @@ import { shortHash } from "../extensions/shared.ts";
 
 test("parseHashline parses valid anchor", () => {
 	assert.deepEqual(parseHashline("42:deadbeef"), { line: 42, hash: "deadbeef" });
+	assert.equal(parseHashline("42:deadbee"), null);
 	assert.equal(parseHashline("bad-anchor"), null);
 });
 
@@ -61,6 +62,32 @@ test("applyHashlineEdits rejects hash mismatch", () => {
 		() => applyHashlineEdits("a\nb", [{ hashline: "2:deadbeef", newText: "B" }], "a.txt"),
 		/hashline mismatch/,
 	);
+});
+
+test("applyHashlineEdits verifies all anchors against the original snapshot", () => {
+	const content = "a\nb\nc";
+	const result = applyHashlineEdits(
+		content,
+		[
+			{ hashline: `2:${shortHash("b")}`, newText: "inserted", wholeLine: false },
+			{ hashline: `3:${shortHash("c")}`, newText: "C" },
+		],
+		"a.txt",
+	);
+	assert.equal(result, "a\nb\ninserted\nC");
+});
+
+test("applyHashlineEdits supports multi-line replacement and insertion", () => {
+	const content = "a\nb\nc";
+	const replaced = applyHashlineEdits(content, [{ hashline: `2:${shortHash("b")}`, newText: "B1\nB2" }], "a.txt");
+	assert.equal(replaced, "a\nB1\nB2\nc");
+
+	const inserted = applyHashlineEdits(
+		content,
+		[{ hashline: `2:${shortHash("b")}`, newText: "i1\ni2", wholeLine: false }],
+		"a.txt",
+	);
+	assert.equal(inserted, "a\nb\ni1\ni2\nc");
 });
 
 test("generateDiffString and generatePatch report changed line", () => {
@@ -116,6 +143,21 @@ test("executeRead reads offset/limit and hashlines", async () => {
 		assert.match(text, /^2:[a-f0-9]{8}\|two/m);
 		assert.match(text, /^3:[a-f0-9]{8}\|three/m);
 		assert.match(text, /more lines in file|truncated|Showing lines/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeRead includes a stable trailing empty line in hashline mode", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-read-trailing-"));
+	try {
+		const file = join(dir, "sample.txt");
+		await writeFile(file, "one\ntwo\n", "utf-8");
+		const result = await executeRead(file, 1, undefined, true, undefined, dir);
+		const text = result.content[0]?.text ?? "";
+		assert.match(text, /^1:[a-f0-9]{8}\|one/m);
+		assert.match(text, /^2:[a-f0-9]{8}\|two/m);
+		assert.match(text, /^3:[a-f0-9]{8}\|$/m);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}

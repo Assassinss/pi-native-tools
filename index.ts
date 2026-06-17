@@ -4,7 +4,8 @@ import { registerEditTool } from "./extensions/edit.ts";
 import { registerWriteTool } from "./extensions/write.ts";
 
 export default function (pi: ExtensionAPI) {
-  registerReadTool(pi);
-  registerEditTool(pi);
-  registerWriteTool(pi);
+	registerReadTool(pi);
+	registerEditTool(pi);
+	registerWriteTool(pi);
+	pi.on("session_start", () => {});
 }

@@ -111,3 +111,56 @@ test("registered tools support hashline-guided edit flow", async () => {
 		await rm(dir, { recursive: true, force: true });
 	}
 });
+
+test("registered tools apply multiple hashline edits from one read snapshot", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-hashline-batch-"));
+	try {
+		const pi = createPiStub();
+		extension(pi as any);
+		const read = pi.tools.get("read");
+		const write = pi.tools.get("write");
+		const edit = pi.tools.get("edit");
+		assert.ok(read);
+		assert.ok(write);
+		assert.ok(edit);
+
+		const file = join(dir, "hashline-batch.txt");
+		await write!.execute("1", { path: file, content: "first\nsecond\nthird\n" }, undefined, undefined, { cwd: dir });
+		const readResult = await read!.execute(
+			"2",
+			{ path: file, withHashlines: true },
+			undefined,
+			undefined,
+			{ cwd: dir },
+		);
+		const anchors = new Map(
+			extractText(readResult)
+				.split("\n")
+				.filter((line) => /^\d+:[a-f0-9]{8}\|/.test(line))
+				.map((line) => {
+					const [hashline, content] = line.split("|", 2);
+					return [content, hashline];
+				}),
+		);
+
+		await edit!.execute(
+			"3",
+			{
+				path: file,
+				edits: [
+					{ hashline: anchors.get("second"), newText: "inserted-1\ninserted-2", wholeLine: false },
+					{ hashline: anchors.get("third"), newText: "THIRD" },
+					{ hashline: anchors.get(""), newText: "tail" },
+				],
+			},
+			undefined,
+			undefined,
+			{ cwd: dir },
+		);
+
+		const finalContent = await readFile(file, "utf-8");
+		assert.equal(finalContent, "first\nsecond\ninserted-1\ninserted-2\nTHIRD\ntail");
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});

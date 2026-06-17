@@ -9,9 +9,11 @@ import {
 	createReadStream,
 	ensureReadable,
 	formatSize,
+	joinContentLines,
 	normalizePath,
 	readFile,
 	shortHash,
+	splitContentLines,
 	stat,
 	throwIfAborted,
 	truncateHead,
@@ -62,6 +64,7 @@ export async function executeReadStreaming(
 		let buf = "";
 		let done = false;
 		let finalizeOnClose = false;
+		let endsWithNewline = false;
 
 		readStream.on("data", (chunk: Buffer) => {
 			if (done) return;
@@ -87,6 +90,7 @@ export async function executeReadStreaming(
 
 		readStream.on("end", () => {
 			if (done) return;
+			endsWithNewline = buf.length === 0;
 			if (buf.length > 0 && lineIndex >= startLine && lines.length < maxTargetLines) {
 				lines.push(buf);
 			}
@@ -109,9 +113,10 @@ export async function executeReadStreaming(
 		function finalize() {
 			signal?.removeEventListener("abort", onAbort);
 			try {
+				const outputLines = endsWithNewline && lineIndex >= startLine && lines.length < maxTargetLines ? [...lines, ""] : lines;
 				const outputText = withHashlines
-					? lines.map((line, i) => `${startLine + i + 1}:${shortHash(line)}|${line}`).join("\n")
-					: lines.join("\n");
+					? outputLines.map((line, i) => `${startLine + i + 1}:${shortHash(line)}|${line}`).join("\n")
+					: joinContentLines(outputLines, false);
 				const truncation = truncateHead(outputText);
 				let finalText = truncation.content;
 				const details: ReadToolDetails = {};
@@ -156,7 +161,8 @@ export async function executeRead(
 	const buffer = await readFile(absolutePath);
 	throwIfAborted(signal);
 
-	const allLines = buffer.toString("utf-8").split("\n");
+	const { lines: fileLines, endsWithNewline } = splitContentLines(buffer.toString("utf-8"));
+	const allLines = endsWithNewline ? [...fileLines, ""] : fileLines;
 	const totalFileLines = allLines.length;
 	const startLine = offset ? Math.max(0, offset - 1) : 0;
 	if (startLine >= allLines.length) {

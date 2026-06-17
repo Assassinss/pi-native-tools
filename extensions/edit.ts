@@ -2,13 +2,16 @@ import { createEditToolDefinition, type EditToolDetails, type ExtensionAPI } fro
 import * as Diff from "diff";
 import { Type } from "typebox";
 import {
+	HASH_SHORT_LEN,
 	access,
 	basename,
 	constants,
 	fsWriteFile,
+	joinContentLines,
 	normalizePath,
 	readFile,
 	shortHash,
+	splitContentLines,
 	throwIfAborted,
 	withFileMutationQueue,
 } from "./shared.ts";
@@ -50,7 +53,7 @@ const editSchema = Type.Object(
 );
 
 export function parseHashline(hashline: string): { line: number; hash: string } | null {
-	const match = hashline.match(/^(\d+):([a-f0-9]+)$/i);
+	const match = hashline.match(new RegExp(`^(\\d+):([a-f0-9]{${HASH_SHORT_LEN}})$`, "i"));
 	if (!match) return null;
 	return { line: parseInt(match[1], 10), hash: match[2].toLowerCase() };
 }
@@ -203,46 +206,67 @@ export function applyTextEdits(content: string, edits: Array<{ oldText: string; 
 	return result;
 }
 
+type VerifiedHashlineEdit = {
+	line: number;
+	lineIndex: number;
+	newText: string;
+	wholeLine: boolean;
+};
+
 export function applyHashlineEdits(
 	content: string,
 	edits: Array<{ hashline: string; newText: string; wholeLine?: boolean }>,
 	filePath: string,
 ): string {
-	const lines = content.split("\n");
-	const applied = new Set<number>();
+	const { lines: baseLines, endsWithNewline } = splitContentLines(content);
+	const originalLines = endsWithNewline ? [...baseLines, ""] : [...baseLines];
+	const verified: VerifiedHashlineEdit[] = [];
+	const targetedLines = new Set<number>();
 
 	for (const edit of edits) {
 		const parsed = parseHashline(edit.hashline);
 		if (!parsed) {
-			throw new Error(`Edit failed: invalid hashline format "${edit.hashline}". Expected format: LINE:HEX`);
+			throw new Error(`Edit failed: invalid hashline format "${edit.hashline}". Expected format: LINE:${"a".repeat(HASH_SHORT_LEN)}`);
 		}
 		const { line, hash } = parsed;
-		const idx = line - 1;
-		if (idx < 0 || idx >= lines.length) {
+		const lineIndex = line - 1;
+		if (lineIndex < 0 || lineIndex >= originalLines.length) {
 			throw new Error(
-				`Edit failed: hashline ${edit.hashline} references line ${line}, but file ${filePath} has only ${lines.length} lines. The file may have changed since the hashline was captured.`,
+				`Edit failed: hashline ${edit.hashline} references line ${line}, but file ${filePath} has only ${originalLines.length} lines. The file may have changed since the hashline was captured.`,
 			);
 		}
-		if (applied.has(idx)) {
+		if (targetedLines.has(lineIndex)) {
 			throw new Error(
 				`Edit failed: hashline ${edit.hashline} targets line ${line}, but another edit already targets this line. Merge edits targeting the same line.`,
 			);
 		}
-		if (!verifyHashline(lines[idx], hash)) {
-			const actualHash = shortHash(lines[idx]);
+		if (!verifyHashline(originalLines[lineIndex], hash)) {
+			const actualHash = shortHash(originalLines[lineIndex]);
 			throw new Error(
-				`Edit failed: hashline mismatch at line ${line}. Expected hash: ${hash}, actual: ${actualHash}.\nContent at line ${line}: ${lines[idx]}\nThe file may have changed since the hashline was captured. Use read(withHashlines=true) to get fresh hashline data.`,
+				`Edit failed: hashline mismatch at line ${line}. Expected hash: ${hash}, actual: ${actualHash}.\nContent at line ${line}: ${originalLines[lineIndex]}\nThe file may have changed since the hashline was captured. Use read(withHashlines=true) to get fresh hashline data.`,
 			);
 		}
-		if (edit.wholeLine === undefined || edit.wholeLine === true) {
-			lines[idx] = edit.newText;
-		} else {
-			lines.splice(idx + 1, 0, edit.newText);
-		}
-		applied.add(idx);
+		verified.push({
+			line,
+			lineIndex,
+			newText: edit.newText,
+			wholeLine: edit.wholeLine !== false,
+		});
+		targetedLines.add(lineIndex);
 	}
 
-	return lines.join("\n");
+	const resultLines = [...originalLines];
+	for (const edit of [...verified].sort((a, b) => b.lineIndex - a.lineIndex)) {
+		const replacement = splitContentLines(edit.newText);
+		const replacementLines = replacement.endsWithNewline ? [...replacement.lines, ""] : replacement.lines;
+		if (edit.wholeLine) {
+			resultLines.splice(edit.lineIndex, 1, ...replacementLines);
+			continue;
+		}
+		resultLines.splice(edit.lineIndex + 1, 0, ...replacementLines);
+	}
+
+	return joinContentLines(resultLines, false);
 }
 
 export function validateEditInput(input: {
