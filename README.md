@@ -23,13 +23,13 @@ All tools are registered under Pi's built-in names, so installing this package r
 Git repo:
 
 ```bash
-pi install git:github.com:Assassinss/pi-native-tools.git
+pi install git:github.com/Assassinss/pi-native-tools
 ```
 
-SSH repo URL:
+SSH install form:
 
 ```bash
-git@github.com:Assassinss/pi-native-tools.git
+pi install git:git@github.com:Assassinss/pi-native-tools.git
 ```
 
 ## Native runtime
