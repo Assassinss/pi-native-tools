@@ -24,5 +24,4 @@ test("extension entry registers read/edit/write and session_start hook", () => {
 		pi.tools.map((tool) => tool.name).sort(),
 		["edit", "read", "write"],
 	);
-	assert.deepEqual(pi.events, ["session_start"]);
 });

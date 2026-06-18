@@ -23,7 +23,6 @@ export {
 	fsWriteFile,
 	basename,
 	dirname,
-	resolve,
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
 	formatSize,
@@ -31,10 +30,10 @@ export {
 	withFileMutationQueue,
 };
 
-export const STREAMING_THRESHOLD = 5 * 1024 * 1024;
+export const STREAMING_THRESHOLD = 5 * 1024 * 1024; // ponytail: 5MB threshold, tune if large-file patterns change
 export const WRITE_CHUNK_SIZE = 64 * 1024;
 export const HASH_SHORT_LEN = 8;
-export const STREAM_READ_CHUNK_SIZE = 256 * 1024;
+export const STREAM_READ_CHUNK_SIZE = 256 * 1024; // ponytail: 256KB chunks, tune if read latency matters
 
 export type LineContent = {
 	lines: string[];
@@ -85,8 +84,4 @@ export async function ensureReadable(path: string, absolutePath: string): Promis
 
 export function throwIfAborted(signal: AbortSignal | undefined): void {
 	if (signal?.aborted) throw new Error("Operation aborted");
-}
-
-export function successText(text: string): TextContent[] {
-	return [{ type: "text", text }];
 }

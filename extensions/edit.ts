@@ -62,7 +62,7 @@ export function verifyHashline(lineContent: string, expectedHash: string): boole
 	return shortHash(lineContent).toLowerCase() === expectedHash.toLowerCase();
 }
 
-const EDIT_CONTEXT_LINES = 4;
+const EDIT_CONTEXT_LINES = 4; // ponytail: 4 context lines, tune if diffs need more/less context
 
 export function generateDiffString(
 	oldContent: string,
@@ -182,7 +182,7 @@ export function generatePatch(
 	});
 }
 
-export function applyTextEdits(content: string, edits: Array<{ oldText: string; newText: string }>, filePath: string): string {
+export function applyTextEdits(content: string, edits: Array<{ oldText: string; newText: string }>, filePath: string): string { // ponytail: O(n) scan per edit, n=file lines; O(n*m) worst-case if edits share prefix
 	let result = content;
 	for (const edit of edits) {
 		const idx = result.indexOf(edit.oldText);
@@ -352,7 +352,7 @@ export function registerEditTool(pi: ExtensionAPI): void {
 			const { path, textEdits, hashlineEdits } = validateEditInput(input as any);
 			const absolutePath = normalizePath(path, cwd);
 
-			return withFileMutationQueue(absolutePath, async () => {
+			return withFileMutationQueue(absolutePath, async () => { // ponytail: global lock per-file, prevents concurrent writes; per-account locks if multi-user needed
 				throwIfAborted(signal);
 				try {
 					await access(absolutePath, constants.R_OK | constants.W_OK);

@@ -287,7 +287,6 @@ The implementation now uses a package-friendly multi-file structure:
 - `extensions/read.ts` - read tool registration and streaming read logic
 - `extensions/edit.ts` - edit tool registration and snapshot-verified hashline edit logic
 - `extensions/write.ts` - write tool registration and streaming write logic
-- `.pi/extensions/custom-tools.ts` - thin compatibility wrapper that re-exports `../../index`
 
 **Load for local testing:**
 ```bash
