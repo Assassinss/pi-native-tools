@@ -94,7 +94,7 @@ test("registered tools support hashline-guided edit flow", async () => {
 		const hashline = extractText(readResult)
 			.split("\n")
 			.find((line) => line.includes("|second"))
-			?.split("|")[0];
+			?.split("|", 2)[0];
 		assert.ok(hashline);
 
 		await edit!.execute(
@@ -160,6 +160,53 @@ test("registered tools apply multiple hashline edits from one read snapshot", as
 
 		const finalContent = await readFile(file, "utf-8");
 		assert.equal(finalContent, "first\nsecond\ninserted-1\ninserted-2\nTHIRD\ntail");
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("registered native find and grep work end-to-end", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-native-search-"));
+	try {
+		const pi = createPiStub();
+		extension(pi as any);
+		const write = pi.tools.get("write");
+		const find = pi.tools.get("find");
+		const grep = pi.tools.get("grep");
+		assert.ok(write);
+		assert.ok(find);
+		assert.ok(grep);
+
+		await write!.execute("1", { path: join(dir, "src", "main.ts"), content: "const needle = 1;\n" }, undefined, undefined, { cwd: dir });
+		await write!.execute("2", { path: join(dir, "src", "other.js"), content: "nothing\n" }, undefined, undefined, { cwd: dir });
+
+		const findResult = await find!.execute("3", { pattern: "*.ts", path: join(dir, "src") }, undefined, undefined, { cwd: dir });
+		assert.match(extractText(findResult), /main\.ts/);
+
+		const grepResult = await grep!.execute(
+			"4",
+			{ pattern: "needle", path: join(dir, "src"), glob: "*.ts", context: 0, limit: 10 },
+			undefined,
+			undefined,
+			{ cwd: dir },
+		);
+		assert.match(extractText(grepResult), /main\.ts:1: const needle = 1;/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("registered native bash keeps session state across calls", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-native-bash-"));
+	try {
+		const pi = createPiStub();
+		extension(pi as any);
+		const bash = pi.tools.get("bash");
+		assert.ok(bash);
+
+		const first = await bash!.execute("1", { command: "cd .. && pwd" }, undefined, undefined, { cwd: dir });
+		const second = await bash!.execute("2", { command: "pwd" }, undefined, undefined, { cwd: dir });
+		assert.equal(extractText(second).trim(), extractText(first).trim());
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}

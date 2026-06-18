@@ -16,6 +16,13 @@ import {
 import { executeRead } from "../extensions/read.ts";
 import { executeWrite } from "../extensions/write.ts";
 import { shortHash } from "../extensions/shared.ts";
+import { executeFindNative } from "../extensions/find.ts";
+import { executeGrepNative } from "../extensions/grep.ts";
+import { clearBashSessions, executeBashNative, getBashSessionCount } from "../extensions/bash.ts";
+
+function extractText(result: { content: Array<{ type: string; text: string }> }): string {
+	return result.content.map((item) => item.text).join("\n");
+}
 
 test("parseHashline parses valid anchor", () => {
 	assert.deepEqual(parseHashline("42:deadbeef"), { line: 42, hash: "deadbeef" });
@@ -205,6 +212,147 @@ test("executeRead streams large file", async () => {
 		assert.match(text, /^line/m);
 		assert.match(text, /Streaming read/);
 	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeFindNative uses native glob and returns relative paths", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-find-"));
+	try {
+		await writeFile(join(dir, "a.ts"), "a", "utf-8");
+		await writeFile(join(dir, "b.js"), "b", "utf-8");
+		await writeFile(join(dir, ".hidden.ts"), "c", "utf-8");
+		const result = await executeFindNative("*.ts", undefined, 10, dir, undefined);
+		const text = extractText(result);
+		assert.match(text, /a\.ts/);
+		assert.match(text, /\.hidden\.ts/);
+		assert.doesNotMatch(text, /b\.js/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeFindNative does not report result limit when total matches equal limit", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-find-limit-"));
+	try {
+		await writeFile(join(dir, "a.ts"), "a", "utf-8");
+		await writeFile(join(dir, "b.ts"), "b", "utf-8");
+		const result = await executeFindNative("*.ts", undefined, 2, dir, undefined);
+		assert.equal(result.details?.resultLimitReached, undefined);
+		assert.doesNotMatch(extractText(result), /results limit reached/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeGrepNative uses native grep with context", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-grep-"));
+	try {
+		const file = join(dir, "sample.txt");
+		await writeFile(file, "zero\none\ntwo needle\nthree\n", "utf-8");
+		const result = await executeGrepNative("needle", undefined, undefined, false, false, 1, 10, dir, undefined);
+		const text = extractText(result);
+		assert.match(text, /sample\.txt-2- one/);
+		assert.match(text, /sample\.txt:3: two needle/);
+		assert.match(text, /sample\.txt-4- three/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeGrepNative escapes literals", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-grep-literal-"));
+	try {
+		const file = join(dir, "sample.txt");
+		await writeFile(file, "fetchAnthropicProvider(\nother\n", "utf-8");
+		const result = await executeGrepNative("fetchAnthropicProvider(", undefined, undefined, false, true, 0, 10, dir, undefined);
+		assert.match(extractText(result), /sample\.txt:1: fetchAnthropicProvider\(/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeGrepNative marks linesTruncated for truncated displayed lines", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-grep-truncation-"));
+	try {
+		const file = join(dir, "sample.txt");
+		await writeFile(file, `${"needle"}${"x".repeat(700)}\nshort\n`, "utf-8");
+		const result = await executeGrepNative("needle", undefined, undefined, false, false, 0, 10, dir, undefined);
+		assert.equal(result.details?.linesTruncated, true);
+		assert.match(extractText(result), /Some lines truncated to 500 chars/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeBashNative preserves shell session cwd across calls", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-bash-session-"));
+	try {
+		const first = await executeBashNative("cd .. && pwd", dir, undefined, undefined);
+		const second = await executeBashNative("pwd", dir, undefined, undefined);
+		const firstText = extractText(first).trim();
+		const secondText = extractText(second).trim();
+		assert.equal(secondText, firstText);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeBashNative preserves streamed output in thrown errors", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-bash-error-"));
+	try {
+		await assert.rejects(
+			executeBashNative("echo before-fail && exit 7", dir, undefined, undefined),
+			(error: unknown) => {
+				assert.ok(error instanceof Error);
+				assert.match(error.message, /before-fail/);
+				assert.match(error.message, /Command exited with code 7/);
+				return true;
+			},
+		);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeBashNative throttles progress updates", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-bash-updates-"));
+	const previous = process.env.PI_NATIVE_BASH_UPDATE_THROTTLE_MS;
+	try {
+		process.env.PI_NATIVE_BASH_UPDATE_THROTTLE_MS = "100";
+		const updates: string[] = [];
+		const result = await executeBashNative(
+			"for n in 1 2 3 4 5; do echo $n; sleep 0.02; done",
+			dir,
+			undefined,
+			undefined,
+			(update) => {
+				updates.push(extractText(update));
+			},
+		);
+		assert.match(extractText(result), /5/);
+		assert.ok(updates.length < 6, `expected throttled updates, got ${updates.length}`);
+	} finally {
+		if (previous === undefined) delete process.env.PI_NATIVE_BASH_UPDATE_THROTTLE_MS;
+		else process.env.PI_NATIVE_BASH_UPDATE_THROTTLE_MS = previous;
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeBashNative evicts idle shell sessions", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-bash-evict-"));
+	const previous = process.env.PI_NATIVE_BASH_SESSION_IDLE_MS;
+	try {
+		clearBashSessions();
+		process.env.PI_NATIVE_BASH_SESSION_IDLE_MS = "20";
+		await executeBashNative("pwd", dir, undefined, undefined);
+		assert.equal(getBashSessionCount(), 1);
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		assert.equal(getBashSessionCount(), 0);
+	} finally {
+		clearBashSessions();
+		if (previous === undefined) delete process.env.PI_NATIVE_BASH_SESSION_IDLE_MS;
+		else process.env.PI_NATIVE_BASH_SESSION_IDLE_MS = previous;
 		await rm(dir, { recursive: true, force: true });
 	}
 });

@@ -1,5 +1,5 @@
 {
-  "name": "pi-hashline-tools",
+  "name": "pi-native-tools",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -7,7 +7,8 @@
     "pi-package"
   ],
   "scripts": {
-    "test": "node --test tests/**/*.test.ts"
+    "test": "node --test tests/**/*.test.ts",
+    "bench": "node scripts/bench.ts"
   },
   "pi": {
     "extensions": [
@@ -21,6 +22,13 @@
   },
   "dependencies": {
     "diff": "^8.0.4"
+  },
+  "optionalDependencies": {
+    "@oh-my-pi/pi-natives-darwin-arm64": "16.0.6",
+    "@oh-my-pi/pi-natives-darwin-x64": "16.0.6",
+    "@oh-my-pi/pi-natives-linux-arm64": "16.0.6",
+    "@oh-my-pi/pi-natives-linux-x64": "16.0.6",
+    "@oh-my-pi/pi-natives-win32-x64": "16.0.6"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "^0.79.6",
