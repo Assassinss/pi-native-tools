@@ -26,11 +26,11 @@
     "diff": "^8.0.4"
   },
   "optionalDependencies": {
-    "@oh-my-pi/pi-natives-darwin-arm64": "16.0.6",
-    "@oh-my-pi/pi-natives-darwin-x64": "16.0.6",
-    "@oh-my-pi/pi-natives-linux-arm64": "16.0.6",
-    "@oh-my-pi/pi-natives-linux-x64": "16.0.6",
-    "@oh-my-pi/pi-natives-win32-x64": "16.0.6"
+    "@oh-my-pi/pi-natives-darwin-arm64": "latest",
+    "@oh-my-pi/pi-natives-darwin-x64": "latest",
+    "@oh-my-pi/pi-natives-linux-arm64": "latest",
+    "@oh-my-pi/pi-natives-linux-x64": "latest",
+    "@oh-my-pi/pi-natives-win32-x64": "latest"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "^0.79.6",
