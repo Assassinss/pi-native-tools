@@ -8,7 +8,9 @@
   ],
   "scripts": {
     "test": "node --test tests/**/*.test.ts",
-    "bench": "node scripts/bench.ts"
+    "bench": "npm run bench:native && npm run bench:tools",
+    "bench:native": "node scripts/bench.ts",
+    "bench:tools": "node scripts/tool-bench.ts"
   },
   "pi": {
     "extensions": [
