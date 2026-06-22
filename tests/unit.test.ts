@@ -48,6 +48,38 @@ test("applyTextEdits rejects non-unique match", () => {
 	);
 });
 
+test("applyTextEdits resolves all matches against the original content", () => {
+	const result = applyTextEdits(
+		"alpha beta gamma",
+		[
+			{ oldText: "alpha", newText: "A" },
+			{ oldText: "gamma", newText: "G" },
+		],
+		"a.txt",
+	);
+	assert.equal(result, "A beta G");
+});
+
+test("applyTextEdits rejects overlapping edits", () => {
+	assert.throws(
+		() =>
+			applyTextEdits(
+				"abcdef",
+				[
+					{ oldText: "abc", newText: "A" },
+					{ oldText: "bcd", newText: "B" },
+				],
+				"a.txt",
+			),
+		/overlap/,
+	);
+});
+
+test("applyTextEdits handles one edit without changing semantics", () => {
+	const result = applyTextEdits("prefix target suffix", [{ oldText: "target", newText: "done" }], "a.txt");
+	assert.equal(result, "prefix done suffix");
+});
+
 test("applyHashlineEdits replaces whole line", () => {
 	const content = "a\nb\nc";
 	const result = applyHashlineEdits(content, [{ hashline: `2:${shortHash("b")}`, newText: "B" }], "a.txt");
@@ -200,6 +232,23 @@ test("executeWrite writes and verifies large streaming file", async () => {
 	}
 });
 
+test("executeWrite streams large unicode content without splitting surrogate pairs", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-write-large-unicode-"));
+	try {
+		const file = join(dir, "large-unicode.txt");
+		const content = "😀0123456789abcdef\n".repeat(350000);
+		const contentBytes = Buffer.byteLength(content, "utf-8");
+		assert.ok(contentBytes > 5 * 1024 * 1024);
+		const result = await executeWrite(file, content, undefined, dir);
+		const written = await readFile(file, "utf-8");
+		assert.equal(written, content);
+		assert.equal(result.details?.size, contentBytes);
+		assert.match(result.content[0]?.text ?? "", /via streaming/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
 test("executeRead streams large file", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-tools-stream-read-"));
 	try {
@@ -211,6 +260,22 @@ test("executeRead streams large file", async () => {
 		const text = result.content[0]?.text ?? "";
 		assert.match(text, /^line/m);
 		assert.match(text, /Streaming read/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeRead stops large streaming reads at the default line limit", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-stream-read-default-"));
+	try {
+		const file = join(dir, "large-read-default.txt");
+		const content = "line\n".repeat(1400000);
+		await writeFile(file, content, "utf-8");
+		const result = await executeRead(file, undefined, undefined, false, undefined, dir);
+		const text = result.content[0]?.text ?? "";
+		assert.match(text, /Streaming read: showing lines 1-\d+ of approx/);
+		assert.match(text, /Use offset=\d+ to continue/);
+		assert.doesNotMatch(text, /Streaming read complete/);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}

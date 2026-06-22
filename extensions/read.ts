@@ -65,6 +65,7 @@ export async function executeReadStreaming(
 		let done = false;
 		let finalizeOnClose = false;
 		let endsWithNewline = false;
+		let hitTargetLines = false;
 
 		readStream.on("data", (chunk: Buffer) => {
 			if (done) return;
@@ -80,7 +81,8 @@ export async function executeReadStreaming(
 				}
 				lineIndex++;
 
-				if (lines.length >= maxTargetLines && limit !== undefined) {
+				if (lines.length >= maxTargetLines) {
+					hitTargetLines = true;
 					finalizeOnClose = true;
 					readStream.destroy();
 					break;
@@ -121,14 +123,14 @@ export async function executeReadStreaming(
 				let finalText = truncation.content;
 				const details: ReadToolDetails = {};
 
-				if (truncation.truncated) {
-					const nextOffset = startLine + truncation.outputLines + 1;
-					const truncatedBy =
-						truncation.truncatedBy === "lines"
-							? `${truncation.outputLines} lines`
-							: formatSize(truncation.outputBytes);
-					finalText += `\n\n[Streaming read: showing lines ${startLine + 1}-${startLine + truncation.outputLines} of approx ${Math.ceil(fileStat.size / 80)} (truncated at ${truncatedBy}). Use offset=${nextOffset} to continue.]`;
-					details.truncation = truncation;
+				if (truncation.truncated || hitTargetLines) {
+					const shownLines = truncation.truncated ? truncation.outputLines : outputLines.length;
+					const nextOffset = startLine + shownLines + 1;
+					const truncatedSuffix = truncation.truncated
+						? ` (truncated at ${truncation.truncatedBy === "lines" ? `${truncation.outputLines} lines` : formatSize(truncation.outputBytes)})`
+						: "";
+					finalText += `\n\n[Streaming read: showing lines ${startLine + 1}-${startLine + shownLines} of approx ${Math.ceil(fileStat.size / 80)}${truncatedSuffix}. Use offset=${nextOffset} to continue.]`;
+					if (truncation.truncated) details.truncation = truncation;
 				} else {
 					finalText += `\n\n[Streaming read complete: ${lines.length} lines]`;
 				}

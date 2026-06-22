@@ -1,11 +1,10 @@
 import { createEditToolDefinition, type EditToolDetails, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import * as Diff from "diff";
+import type { StructuredPatch } from "diff";
 import { Type } from "typebox";
 import {
 	HASH_SHORT_LEN,
-	access,
 	basename,
-	constants,
 	fsWriteFile,
 	joinContentLines,
 	normalizePath,
@@ -69,105 +68,8 @@ export function generateDiffString(
 	newContent: string,
 	contextLines = EDIT_CONTEXT_LINES,
 ): { diff: string; firstChangedLine?: number } {
-	const parts = Diff.diffLines(oldContent, newContent);
-	const output: string[] = [];
-	const oldLines = oldContent.split("\n");
-	const newLines = newContent.split("\n");
-	const maxLineNum = Math.max(oldLines.length, newLines.length);
-	const lineNumWidth = String(maxLineNum).length;
-	let oldLineNum = 1;
-	let newLineNum = 1;
-	let lastWasChange = false;
-	let firstChangedLine: number | undefined;
-
-	for (let i = 0; i < parts.length; i++) {
-		const part = parts[i];
-		const raw = part.value.split("\n");
-		if (raw[raw.length - 1] === "") raw.pop();
-
-		if (part.added || part.removed) {
-			if (firstChangedLine === undefined) firstChangedLine = newLineNum;
-			for (const line of raw) {
-				if (part.added) {
-					const lineNum = String(newLineNum).padStart(lineNumWidth, " ");
-					output.push(`+${lineNum} ${line}`);
-					newLineNum++;
-				} else {
-					const lineNum = String(oldLineNum).padStart(lineNumWidth, " ");
-					output.push(`-${lineNum} ${line}`);
-					oldLineNum++;
-				}
-			}
-			lastWasChange = true;
-		} else {
-			const nextPartIsChange = i < parts.length - 1 && (parts[i + 1].added || parts[i + 1].removed);
-			const hasLeadingChange = lastWasChange;
-			const hasTrailingChange = nextPartIsChange;
-
-			if (hasLeadingChange && hasTrailingChange) {
-				if (raw.length <= contextLines * 2) {
-					for (const line of raw) {
-						const lineNum = String(oldLineNum).padStart(lineNumWidth, " ");
-						output.push(` ${lineNum} ${line}`);
-						oldLineNum++;
-						newLineNum++;
-					}
-				} else {
-					const leadingLines = raw.slice(0, contextLines);
-					const trailingLines = raw.slice(raw.length - contextLines);
-					const skippedLines = raw.length - leadingLines.length - trailingLines.length;
-					for (const line of leadingLines) {
-						const lineNum = String(oldLineNum).padStart(lineNumWidth, " ");
-						output.push(` ${lineNum} ${line}`);
-						oldLineNum++;
-						newLineNum++;
-					}
-					output.push(` ${"".padStart(lineNumWidth, " ")} ...`);
-					oldLineNum += skippedLines;
-					newLineNum += skippedLines;
-					for (const line of trailingLines) {
-						const lineNum = String(oldLineNum).padStart(lineNumWidth, " ");
-						output.push(` ${lineNum} ${line}`);
-						oldLineNum++;
-						newLineNum++;
-					}
-				}
-			} else if (hasLeadingChange) {
-				const shownLines = raw.slice(0, contextLines);
-				const skippedLines = raw.length - shownLines.length;
-				for (const line of shownLines) {
-					const lineNum = String(oldLineNum).padStart(lineNumWidth, " ");
-					output.push(` ${lineNum} ${line}`);
-					oldLineNum++;
-					newLineNum++;
-				}
-				if (skippedLines > 0) {
-					output.push(` ${"".padStart(lineNumWidth, " ")} ...`);
-					oldLineNum += skippedLines;
-					newLineNum += skippedLines;
-				}
-			} else if (hasTrailingChange) {
-				const skippedLines = Math.max(0, raw.length - contextLines);
-				if (skippedLines > 0) {
-					output.push(` ${"".padStart(lineNumWidth, " ")} ...`);
-					oldLineNum += skippedLines;
-					newLineNum += skippedLines;
-				}
-				for (const line of raw.slice(skippedLines)) {
-					const lineNum = String(oldLineNum).padStart(lineNumWidth, " ");
-					output.push(` ${lineNum} ${line}`);
-					oldLineNum++;
-					newLineNum++;
-				}
-			} else {
-				oldLineNum += raw.length;
-				newLineNum += raw.length;
-			}
-			lastWasChange = false;
-		}
-	}
-
-	return { diff: output.join("\n"), firstChangedLine };
+	const patch = generateStructuredPatch("file", oldContent, newContent, contextLines);
+	return generateDiffStringFromPatch(patch);
 }
 
 export function generatePatch(
@@ -182,28 +84,114 @@ export function generatePatch(
 	});
 }
 
-export function applyTextEdits(content: string, edits: Array<{ oldText: string; newText: string }>, filePath: string): string { // ponytail: O(n) scan per edit, n=file lines; O(n*m) worst-case if edits share prefix
-	let result = content;
-	for (const edit of edits) {
-		const idx = result.indexOf(edit.oldText);
-		if (idx === -1) {
-			const normalizedOld = edit.oldText.endsWith("\n") ? edit.oldText.slice(0, -1) : edit.oldText;
-			const idx2 = result.indexOf(normalizedOld);
-			if (idx2 === -1) {
-				throw new Error(
-					`Edit failed: oldText not found in ${filePath}. The text to replace must match exactly, including whitespace. Occurrence count: ${result.split(edit.oldText).length - 1}`,
-				);
+export function generateStructuredPatch(
+	filePath: string,
+	oldContent: string,
+	newContent: string,
+	contextLines = EDIT_CONTEXT_LINES,
+): StructuredPatch {
+	return Diff.structuredPatch(filePath, filePath, oldContent, newContent, undefined, undefined, {
+		context: contextLines,
+	})!;
+}
+
+export function formatStructuredPatch(patch: StructuredPatch): string {
+	return Diff.formatPatch(patch, Diff.FILE_HEADERS_ONLY);
+}
+
+export function generateDiffStringFromPatch(patch: StructuredPatch): { diff: string; firstChangedLine?: number } {
+	const output: string[] = [];
+	const maxLineNum = Math.max(
+		1,
+		...patch.hunks.flatMap((hunk) => [hunk.oldStart + Math.max(hunk.oldLines - 1, 0), hunk.newStart + Math.max(hunk.newLines - 1, 0)]),
+	);
+	const lineNumWidth = String(maxLineNum).length;
+	let firstChangedLine: number | undefined;
+	let previousOldEnd = 0;
+
+	for (const hunk of patch.hunks) {
+		if ((previousOldEnd === 0 && hunk.oldStart > 1) || (previousOldEnd > 0 && hunk.oldStart > previousOldEnd + 1)) {
+			output.push(` ${"".padStart(lineNumWidth, " ")} ...`);
+		}
+
+		let oldLineNum = hunk.oldStart;
+		let newLineNum = hunk.newStart;
+		for (const line of hunk.lines) {
+			if (line.startsWith("\\")) continue;
+			const marker = line[0]!;
+			const text = line.slice(1);
+			if (marker === "+") {
+				if (firstChangedLine === undefined) firstChangedLine = newLineNum;
+				output.push(`+${String(newLineNum).padStart(lineNumWidth, " ")} ${text}`);
+				newLineNum++;
+				continue;
 			}
-			result = result.slice(0, idx2) + edit.newText + result.slice(idx2 + normalizedOld.length);
-		} else {
-			const secondIdx = result.indexOf(edit.oldText, idx + 1);
-			if (secondIdx !== -1) {
-				throw new Error(`Edit failed: oldText appears multiple times in ${filePath}. Provide more context to make it unique.`);
+			if (marker === "-") {
+				if (firstChangedLine === undefined) firstChangedLine = newLineNum;
+				output.push(`-${String(oldLineNum).padStart(lineNumWidth, " ")} ${text}`);
+				oldLineNum++;
+				continue;
 			}
-			result = result.slice(0, idx) + edit.newText + result.slice(idx + edit.oldText.length);
+			output.push(` ${String(oldLineNum).padStart(lineNumWidth, " ")} ${text}`);
+			oldLineNum++;
+			newLineNum++;
+		}
+		previousOldEnd = Math.max(previousOldEnd, oldLineNum - 1);
+	}
+
+	return { diff: output.join("\n"), firstChangedLine };
+}
+
+type ResolvedTextEdit = {
+	start: number;
+	end: number;
+	newText: string;
+};
+
+function resolveTextEdit(content: string, oldText: string, newText: string, filePath: string): ResolvedTextEdit {
+	const exactStart = content.indexOf(oldText);
+	if (exactStart !== -1) {
+		if (content.indexOf(oldText, exactStart + 1) !== -1) {
+			throw new Error(`Edit failed: oldText appears multiple times in ${filePath}. Provide more context to make it unique.`);
+		}
+		return { start: exactStart, end: exactStart + oldText.length, newText };
+	}
+
+	const normalizedOld = oldText.endsWith("\n") ? oldText.slice(0, -1) : oldText;
+	const normalizedStart = content.indexOf(normalizedOld);
+	if (normalizedStart === -1) {
+		throw new Error(`Edit failed: oldText not found in ${filePath}. The text to replace must match exactly, including whitespace.`);
+	}
+	if (content.indexOf(normalizedOld, normalizedStart + 1) !== -1) {
+		throw new Error(`Edit failed: oldText appears multiple times in ${filePath}. Provide more context to make it unique.`);
+	}
+	return { start: normalizedStart, end: normalizedStart + normalizedOld.length, newText };
+}
+
+export function applyTextEdits(content: string, edits: Array<{ oldText: string; newText: string }>, filePath: string): string {
+	const resolved = edits
+		.map((edit) => resolveTextEdit(content, edit.oldText, edit.newText, filePath))
+		.sort((a, b) => a.start - b.start);
+
+	for (let i = 1; i < resolved.length; i++) {
+		if (resolved[i - 1]!.end > resolved[i]!.start) {
+			throw new Error(`Edit failed: edits overlap in ${filePath}. Merge nearby changes into one edit.`);
 		}
 	}
-	return result;
+
+	if (resolved.length === 1) {
+		const edit = resolved[0]!;
+		return content.slice(0, edit.start) + edit.newText + content.slice(edit.end);
+	}
+
+	const parts: string[] = [];
+	let lastIndex = 0;
+	for (const edit of resolved) {
+		parts.push(content.slice(lastIndex, edit.start), edit.newText);
+		lastIndex = edit.end;
+	}
+	parts.push(content.slice(lastIndex));
+	return parts.join("");
 }
 
 type VerifiedHashlineEdit = {
@@ -354,17 +342,15 @@ export function registerEditTool(pi: ExtensionAPI): void {
 
 			return withFileMutationQueue(absolutePath, async () => { // ponytail: global lock per-file, prevents concurrent writes; per-account locks if multi-user needed
 				throwIfAborted(signal);
+				let content: string;
 				try {
-					await access(absolutePath, constants.R_OK | constants.W_OK);
+					content = (await readFile(absolutePath)).toString("utf-8");
 				} catch (err: any) {
 					throwIfAborted(signal);
 					if (err.code === "ENOENT") throw new Error(`File not found: ${path}. Use write to create new files.`);
 					if (err.code === "EACCES") throw new Error(`Permission denied: ${path}`);
 					throw new Error(`Cannot access file: ${path}. Error: ${err.message}`);
 				}
-
-				throwIfAborted(signal);
-				const content = (await readFile(absolutePath)).toString("utf-8");
 				throwIfAborted(signal);
 
 				let newContent = content;
@@ -382,14 +368,14 @@ export function registerEditTool(pi: ExtensionAPI): void {
 					throw new Error(`Failed to write ${path}: ${err.message}`);
 				}
 
-				const diffResult = generateDiffString(content, newContent);
-				const patch = generatePatch(basename(absolutePath), content, newContent);
+				const patch = generateStructuredPatch(basename(absolutePath), content, newContent);
+				const diffResult = generateDiffStringFromPatch(patch);
 				const editCount = textEdits.length + hashlineEdits.length;
 				return {
 					content: [{ type: "text", text: `Successfully applied ${editCount} edit(s) to ${path}.` }],
 					details: {
 						diff: diffResult.diff,
-						patch,
+						patch: formatStructuredPatch(patch),
 						firstChangedLine: diffResult.firstChangedLine,
 					} as EditToolDetails,
 				};

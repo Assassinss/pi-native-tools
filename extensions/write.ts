@@ -22,6 +22,18 @@ const writeSchema = Type.Object({
 	content: Type.String({ description: "Content to write to the file" }),
 });
 
+function getSafeChunkEnd(content: string, start: number, maxCodeUnits: number): number {
+	let end = Math.min(start + maxCodeUnits, content.length);
+	if (end < content.length) {
+		const prev = content.charCodeAt(end - 1);
+		const next = content.charCodeAt(end);
+		const prevIsHighSurrogate = prev >= 0xd800 && prev <= 0xdbff;
+		const nextIsLowSurrogate = next >= 0xdc00 && next <= 0xdfff;
+		if (prevIsHighSurrogate && nextIsLowSurrogate) end--;
+	}
+	return end;
+}
+
 export async function executeWrite(
 	path: string,
 	content: string,
@@ -44,8 +56,9 @@ export async function executeWrite(
 	if (contentSize < STREAMING_THRESHOLD) {
 		return withFileMutationQueue(absolutePath, async () => {
 			throwIfAborted(signal);
+			const contentBuffer = Buffer.from(content, "utf-8");
 			try {
-				await fsWriteFile(absolutePath, content, "utf-8");
+				await fsWriteFile(absolutePath, contentBuffer);
 			} catch (err: any) {
 				if (err.code === "EACCES") throw new Error(`Permission denied writing: ${path}`);
 				if (err.code === "ENOSPC") throw new Error(`Disk full: cannot write ${formatSize(contentSize)} to ${path}`);
@@ -53,7 +66,7 @@ export async function executeWrite(
 			}
 			throwIfAborted(signal);
 			const writtenStat = await stat(absolutePath);
-			const writtenHash = fullHash(content);
+			const writtenHash = fullHash(contentBuffer);
 			return {
 				content: [
 					{
@@ -69,7 +82,6 @@ export async function executeWrite(
 	return withFileMutationQueue(absolutePath, async () => {
 		throwIfAborted(signal);
 		const hash = createHash("sha256");
-		let bytesWritten = 0;
 
 		return new Promise<{ content: TextContent[]; details: { size: number; hash: string } }>((resolve, reject) => {
 			let writeStream = createWriteStream(absolutePath, {
@@ -94,10 +106,10 @@ export async function executeWrite(
 				try {
 					const fileHash = hash.digest("hex");
 					const writtenStat = await stat(absolutePath);
-					if (writtenStat.size !== bytesWritten) {
+					if (writtenStat.size !== contentSize) {
 						reject(
 							new Error(
-								`Write verification failed for ${path}: expected ${bytesWritten} bytes, got ${writtenStat.size} bytes. File may be corrupt.`,
+								`Write verification failed for ${path}: expected ${contentSize} bytes, got ${writtenStat.size} bytes. File may be corrupt.`,
 							),
 						);
 						return;
@@ -116,22 +128,21 @@ export async function executeWrite(
 				}
 			});
 
-			const buffer = Buffer.from(content, "utf-8");
 			let offset = 0;
 
 			const writeNextChunk = () => {
-				if (offset >= buffer.length) {
-					writeStream.end();
-					return;
+				while (offset < content.length) {
+					const end = getSafeChunkEnd(content, offset, WRITE_CHUNK_SIZE);
+					const chunk = content.slice(offset, end);
+					const chunkBuffer = Buffer.from(chunk, "utf-8");
+					hash.update(chunkBuffer);
+					offset = end;
+					if (!writeStream.write(chunkBuffer)) {
+						writeStream.once("drain", writeNextChunk);
+						return;
+					}
 				}
-				const end = Math.min(offset + WRITE_CHUNK_SIZE, buffer.length);
-				const chunk = buffer.subarray(offset, end);
-				hash.update(chunk);
-				bytesWritten += chunk.length;
-				offset = end;
-				const shouldContinue = writeStream.write(chunk);
-				if (!shouldContinue) writeStream.once("drain", writeNextChunk);
-				else setImmediate(writeNextChunk);
+				writeStream.end();
 			};
 
 			writeNextChunk();
