@@ -148,24 +148,34 @@ type ResolvedTextEdit = {
 	newText: string;
 };
 
-function resolveTextEdit(content: string, oldText: string, newText: string, filePath: string): ResolvedTextEdit {
-	const exactStart = content.indexOf(oldText);
-	if (exactStart !== -1) {
-		if (content.indexOf(oldText, exactStart + 1) !== -1) {
-			throw new Error(`Edit failed: oldText appears multiple times in ${filePath}. Provide more context to make it unique.`);
-		}
-		return { start: exactStart, end: exactStart + oldText.length, newText };
-	}
-
-	const normalizedOld = oldText.endsWith("\n") ? oldText.slice(0, -1) : oldText;
-	const normalizedStart = content.indexOf(normalizedOld);
-	if (normalizedStart === -1) {
-		throw new Error(`Edit failed: oldText not found in ${filePath}. The text to replace must match exactly, including whitespace.`);
-	}
-	if (content.indexOf(normalizedOld, normalizedStart + 1) !== -1) {
+function resolveUniqueMatch(content: string, candidate: string, newText: string, filePath: string): ResolvedTextEdit | null {
+	const start = content.indexOf(candidate);
+	if (start === -1) return null;
+	if (content.indexOf(candidate, start + 1) !== -1) {
 		throw new Error(`Edit failed: oldText appears multiple times in ${filePath}. Provide more context to make it unique.`);
 	}
-	return { start: normalizedStart, end: normalizedStart + normalizedOld.length, newText };
+	return { start, end: start + candidate.length, newText };
+}
+
+function resolveTextEdit(content: string, oldText: string, newText: string, filePath: string): ResolvedTextEdit {
+	const candidates = [oldText];
+	const trimmedTrailingNewline = oldText.endsWith("\n") ? oldText.slice(0, -1) : oldText;
+	if (trimmedTrailingNewline !== oldText) candidates.push(trimmedTrailingNewline);
+	if (content.includes("\r\n") && oldText.includes("\n") && !oldText.includes("\r\n")) {
+		const crlfOldText = oldText.replace(/\n/g, "\r\n");
+		candidates.push(crlfOldText);
+		if (trimmedTrailingNewline !== oldText) {
+			const trimmedCrlfOldText = trimmedTrailingNewline.replace(/\n/g, "\r\n");
+			if (trimmedCrlfOldText !== crlfOldText) candidates.push(trimmedCrlfOldText);
+		}
+	}
+
+	for (const candidate of candidates) {
+		const resolved = resolveUniqueMatch(content, candidate, newText, filePath);
+		if (resolved) return resolved;
+	}
+
+	throw new Error(`Edit failed: oldText not found in ${filePath}. The text to replace must match exactly, including whitespace.`);
 }
 
 export function applyTextEdits(content: string, edits: Array<{ oldText: string; newText: string }>, filePath: string): string {

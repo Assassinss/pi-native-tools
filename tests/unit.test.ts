@@ -80,6 +80,11 @@ test("applyTextEdits handles one edit without changing semantics", () => {
 	assert.equal(result, "prefix done suffix");
 });
 
+test("applyTextEdits matches LF oldText against CRLF content", () => {
+	const result = applyTextEdits("alpha\r\nbeta\r\n", [{ oldText: "alpha\nbeta\n", newText: "done\n" }], "a.txt");
+	assert.equal(result, "done\n");
+});
+
 test("applyHashlineEdits replaces whole line", () => {
 	const content = "a\nb\nc";
 	const result = applyHashlineEdits(content, [{ hashline: `2:${shortHash("b")}`, newText: "B" }], "a.txt");
