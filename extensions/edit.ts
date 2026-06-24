@@ -13,7 +13,9 @@ import {
 	splitContentLines,
 	throwIfAborted,
 	withFileMutationQueue,
+	dirname,
 } from "./shared.ts";
+import { invalidateFsScanCache } from "./omp-native.ts";
 
 const replaceEditSchema = Type.Object(
 	{
@@ -323,6 +325,11 @@ export function prepareEditArguments(input: unknown): Record<string, unknown> {
 	return args;
 }
 
+function invalidateScanCache(absolutePath: string): void {
+	invalidateFsScanCache?.(absolutePath);
+	invalidateFsScanCache?.(dirname(absolutePath));
+}
+
 export function registerEditTool(pi: ExtensionAPI): void {
 	const builtInEdit = createEditToolDefinition(process.cwd());
 
@@ -350,7 +357,7 @@ export function registerEditTool(pi: ExtensionAPI): void {
 			const { path, textEdits, hashlineEdits } = validateEditInput(input as any);
 			const absolutePath = normalizePath(path, cwd);
 
-			return withFileMutationQueue(absolutePath, async () => { // ponytail: global lock per-file, prevents concurrent writes; per-account locks if multi-user needed
+			return withFileMutationQueue(absolutePath, async () => {
 				throwIfAborted(signal);
 				let content: string;
 				try {
@@ -377,6 +384,7 @@ export function registerEditTool(pi: ExtensionAPI): void {
 					if (err.code === "ENOSPC") throw new Error(`Disk full: cannot write to ${path}`);
 					throw new Error(`Failed to write ${path}: ${err.message}`);
 				}
+				invalidateScanCache(absolutePath);
 
 				const patch = generateStructuredPatch(basename(absolutePath), content, newContent);
 				const diffResult = generateDiffStringFromPatch(patch);

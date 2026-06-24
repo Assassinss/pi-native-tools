@@ -16,6 +16,7 @@ import {
 	withFileMutationQueue,
 } from "./shared.ts";
 import { createHash } from "node:crypto";
+import { invalidateFsScanCache } from "./omp-native.ts";
 
 const writeSchema = Type.Object({
 	path: Type.String({ description: "Path to the file to write (relative or absolute)" }),
@@ -32,6 +33,11 @@ function getSafeChunkEnd(content: string, start: number, maxCodeUnits: number): 
 		if (prevIsHighSurrogate && nextIsLowSurrogate) end--;
 	}
 	return end;
+}
+
+function invalidateScanCache(absolutePath: string, dir: string): void {
+	invalidateFsScanCache?.(absolutePath);
+	invalidateFsScanCache?.(dir);
 }
 
 export async function executeWrite(
@@ -67,6 +73,7 @@ export async function executeWrite(
 			throwIfAborted(signal);
 			const writtenStat = await stat(absolutePath);
 			const writtenHash = fullHash(contentBuffer);
+			invalidateScanCache(absolutePath, dir);
 			return {
 				content: [
 					{
@@ -114,6 +121,7 @@ export async function executeWrite(
 						);
 						return;
 					}
+					invalidateScanCache(absolutePath, dir);
 					resolve({
 						content: [
 							{

@@ -302,6 +302,23 @@ test("executeFindNative uses native glob and returns relative paths", async () =
 	}
 });
 
+test("executeFindNative streams progress updates", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-find-stream-"));
+	try {
+		await writeFile(join(dir, "a.ts"), "a", "utf-8");
+		await writeFile(join(dir, "b.ts"), "b", "utf-8");
+		const updates: string[] = [];
+		const result = await executeFindNative("*.ts", undefined, 10, dir, undefined, (update) => {
+			updates.push(extractText(update));
+		});
+		assert.match(extractText(result), /a\.ts/);
+		assert.ok(updates.length >= 1);
+		assert.match(updates[0] ?? "", /\.ts/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
 test("executeFindNative does not report result limit when total matches equal limit", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-tools-find-limit-"));
 	try {
@@ -315,16 +332,50 @@ test("executeFindNative does not report result limit when total matches equal li
 	}
 });
 
+test("executeWrite invalidates native scan cache", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-write-cache-"));
+	try {
+		await executeWrite(join(dir, "a.ts"), "const a = 1;\n", undefined, dir);
+		let result = await executeFindNative("*.ts", undefined, 10, dir, undefined);
+		assert.match(extractText(result), /a\.ts/);
+
+		await executeWrite(join(dir, "b.ts"), "const b = 2;\n", undefined, dir);
+		result = await executeFindNative("*.ts", undefined, 10, dir, undefined);
+		const text = extractText(result);
+		assert.match(text, /a\.ts/);
+		assert.match(text, /b\.ts/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
 test("executeGrepNative uses native grep with context", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-tools-grep-"));
 	try {
 		const file = join(dir, "sample.txt");
 		await writeFile(file, "zero\none\ntwo needle\nthree\n", "utf-8");
-		const result = await executeGrepNative("needle", undefined, undefined, false, false, 1, 10, dir, undefined);
+		const result = await executeGrepNative("needle", undefined, undefined, false, false, 1, 10, dir, undefined, undefined);
 		const text = extractText(result);
 		assert.match(text, /sample\.txt-2- one/);
 		assert.match(text, /sample\.txt:3: two needle/);
 		assert.match(text, /sample\.txt-4- three/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeGrepNative streams progress updates in content mode", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-grep-stream-"));
+	try {
+		await writeFile(join(dir, "a.txt"), "needle\n", "utf-8");
+		await writeFile(join(dir, "b.txt"), "needle\n", "utf-8");
+		const updates: string[] = [];
+		const result = await executeGrepNative("needle", undefined, undefined, false, false, 0, 10, dir, undefined, "content", (update) => {
+			updates.push(extractText(update));
+		});
+		assert.match(extractText(result), /needle/);
+		assert.ok(updates.length >= 1);
+		assert.match(updates[0] ?? "", /needle/);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
@@ -335,8 +386,37 @@ test("executeGrepNative escapes literals", async () => {
 	try {
 		const file = join(dir, "sample.txt");
 		await writeFile(file, "fetchAnthropicProvider(\nother\n", "utf-8");
-		const result = await executeGrepNative("fetchAnthropicProvider(", undefined, undefined, false, true, 0, 10, dir, undefined);
+		const result = await executeGrepNative("fetchAnthropicProvider(", undefined, undefined, false, true, 0, 10, dir, undefined, undefined);
 		assert.match(extractText(result), /sample\.txt:1: fetchAnthropicProvider\(/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeGrepNative supports count mode", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-grep-count-"));
+	try {
+		await writeFile(join(dir, "a.txt"), "needle\nneedle\nother\n", "utf-8");
+		await writeFile(join(dir, "b.txt"), "needle\n", "utf-8");
+		const result = await executeGrepNative("needle", undefined, undefined, false, false, 0, 10, dir, undefined, "count");
+		const text = extractText(result);
+		assert.match(text, /a\.txt: 2/);
+		assert.match(text, /b\.txt: 1/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeGrepNative supports filesWithMatches mode", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-grep-files-"));
+	try {
+		await writeFile(join(dir, "a.txt"), "needle\nneedle\nother\n", "utf-8");
+		await writeFile(join(dir, "b.txt"), "needle\n", "utf-8");
+		const result = await executeGrepNative("needle", undefined, undefined, false, false, 0, 10, dir, undefined, "filesWithMatches");
+		const text = extractText(result);
+		assert.match(text, /a\.txt/);
+		assert.match(text, /b\.txt/);
+		assert.doesNotMatch(text, /: 1|: 2|needle/);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
@@ -347,7 +427,7 @@ test("executeGrepNative marks linesTruncated for truncated displayed lines", asy
 	try {
 		const file = join(dir, "sample.txt");
 		await writeFile(file, `${"needle"}${"x".repeat(700)}\nshort\n`, "utf-8");
-		const result = await executeGrepNative("needle", undefined, undefined, false, false, 0, 10, dir, undefined);
+		const result = await executeGrepNative("needle", undefined, undefined, false, false, 0, 10, dir, undefined, undefined);
 		assert.equal(result.details?.linesTruncated, true);
 		assert.match(extractText(result), /Some lines truncated to 500 chars/);
 	} finally {
@@ -364,6 +444,29 @@ test("executeBashNative preserves shell session cwd across calls", async () => {
 		const secondText = extractText(second).trim();
 		assert.equal(secondText, firstText);
 	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeBashNative supports disabling shell sessions per command", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-bash-no-session-"));
+	try {
+		await executeBashNative("cd .. && pwd", dir, undefined, undefined, undefined, { session: false });
+		const second = await executeBashNative("pwd", dir, undefined, undefined, undefined, { session: false });
+		assert.equal(extractText(second).trim(), dir);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeBashNative resets shell session on demand", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-bash-reset-"));
+	try {
+		await executeBashNative("cd ..", dir, undefined, undefined);
+		const reset = await executeBashNative("pwd", dir, undefined, undefined, undefined, { resetSession: true });
+		assert.equal(extractText(reset).trim(), dir);
+	} finally {
+		clearBashSessions();
 		await rm(dir, { recursive: true, force: true });
 	}
 });

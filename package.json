@@ -33,8 +33,8 @@
     "@oh-my-pi/pi-natives-win32-x64": "latest"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "^0.79.6",
-    "@earendil-works/pi-coding-agent": "^0.79.6",
-    "typebox": "^1.2.14"
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
   }
 }

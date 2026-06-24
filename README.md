@@ -18,6 +18,13 @@ The goal is simple:
 
 All tools are registered under Pi's built-in names, so installing this package replaces the default implementations.
 
+## Why `bash`, `find`, and `grep`
+
+- `bash` - keeps a warm native shell per cwd, so repeated commands avoid process startup and can reuse shell state; falls back to one-shot execution when a session is already busy
+- `find` - walks globs in-process, respects `.gitignore`, avoids external `fd` / `rg` startup, and returns normalized relative paths
+- `grep` - searches file content in-process, respects `.gitignore`, supports regex/literal/context/limits, and returns Pi-friendly truncated output without spawning `rg`
+
+
 ## Install
 
 Git repo:

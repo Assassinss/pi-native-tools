@@ -8,6 +8,7 @@ import {
 	type TruncationResult,
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import { executeShell, Shell, type ShellRunResult } from "./omp-native.ts";
 import { randomBytes } from "node:crypto";
 import { constants, createWriteStream } from "node:fs";
@@ -23,7 +24,21 @@ type OutputSnapshot = {
 	fullOutputPath?: string;
 };
 
+type BashOptions = {
+	session?: boolean;
+	resetSession?: boolean;
+};
+
 const builtInBash = createBashToolDefinition(process.cwd());
+const bashSchema = Type.Object(
+	{
+		command: Type.String({ description: "The command to execute" }),
+		timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })),
+		session: Type.Optional(Type.Boolean({ description: "When false, bypass the persistent shell session for this command" })),
+		resetSession: Type.Optional(Type.Boolean({ description: "When true, discard any existing persistent shell session for this cwd before running" })),
+	},
+	{ additionalProperties: false },
+);
 const shellSessions = new Map<string, Shell>();
 const shellSessionsInitialized = new Set<string>();
 const shellSessionsInUse = new Set<string>();
@@ -271,12 +286,16 @@ export async function executeBashNative(
 	timeout: number | undefined,
 	signal: AbortSignal | undefined,
 	onUpdate?: (update: { content: TextContent[]; details?: BashToolDetails }) => void,
+	options?: BashOptions,
 ): Promise<{ content: TextContent[]; details?: BashToolDetails }> {
 	const resolvedCwd = await resolveShellCwd(cwd);
 	const sessionKey = buildSessionKey(resolvedCwd);
-	const sessionBusy = shellSessionsInUse.has(sessionKey);
-	let shell = sessionBusy ? undefined : shellSessions.get(sessionKey);
-	if (!shell && !sessionBusy) {
+	if (options?.resetSession) disposeShellSession(sessionKey);
+
+	const useSession = options?.session !== false;
+	const sessionBusy = useSession && shellSessionsInUse.has(sessionKey);
+	let shell = useSession && !sessionBusy ? shellSessions.get(sessionKey) : undefined;
+	if (!shell && useSession && !sessionBusy) {
 		shell = new Shell();
 		shellSessions.set(sessionKey, shell);
 	}
@@ -374,9 +393,15 @@ export async function executeBashNative(
 export function registerBashTool(pi: ExtensionAPI): void {
 	pi.registerTool({
 		...builtInBash,
+		parameters: bashSchema,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const { command, timeout } = params as { command: string; timeout?: number };
-			return executeBashNative(command, ctx?.cwd ?? process.cwd(), timeout, signal, onUpdate as any);
+			const { command, timeout, session, resetSession } = params as {
+				command: string;
+				timeout?: number;
+				session?: boolean;
+				resetSession?: boolean;
+			};
+			return executeBashNative(command, ctx?.cwd ?? process.cwd(), timeout, signal, onUpdate as any, { session, resetSession });
 		},
 	});
 }

@@ -196,6 +196,88 @@ test("registered native find and grep work end-to-end", async () => {
 	}
 });
 
+test("registered native find and grep stream progress updates", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-native-stream-updates-"));
+	try {
+		const pi = createPiStub();
+		extension(pi as any);
+		const write = pi.tools.get("write");
+		const find = pi.tools.get("find");
+		const grep = pi.tools.get("grep");
+		assert.ok(write);
+		assert.ok(find);
+		assert.ok(grep);
+
+		await write!.execute("1", { path: join(dir, "src", "a.ts"), content: "needle\n" }, undefined, undefined, { cwd: dir });
+		await write!.execute("2", { path: join(dir, "src", "b.ts"), content: "needle\n" }, undefined, undefined, { cwd: dir });
+
+		const findUpdates: string[] = [];
+		await find!.execute(
+			"3",
+			{ pattern: "*.ts", path: join(dir, "src") },
+			undefined,
+			(update) => {
+				findUpdates.push(extractText(update as any));
+			},
+			{ cwd: dir },
+		);
+		assert.ok(findUpdates.length >= 1);
+		assert.match(findUpdates[0] ?? "", /\.ts/);
+
+		const grepUpdates: string[] = [];
+		await grep!.execute(
+			"4",
+			{ pattern: "needle", path: join(dir, "src"), glob: "*.ts", limit: 10 },
+			undefined,
+			(update) => {
+				grepUpdates.push(extractText(update as any));
+			},
+			{ cwd: dir },
+		);
+		assert.ok(grepUpdates.length >= 1);
+		assert.match(grepUpdates[0] ?? "", /needle/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("registered native grep supports count and filesWithMatches modes", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-native-grep-modes-"));
+	try {
+		const pi = createPiStub();
+		extension(pi as any);
+		const write = pi.tools.get("write");
+		const grep = pi.tools.get("grep");
+		assert.ok(write);
+		assert.ok(grep);
+
+		await write!.execute("1", { path: join(dir, "src", "a.ts"), content: "needle\nneedle\n" }, undefined, undefined, { cwd: dir });
+		await write!.execute("2", { path: join(dir, "src", "b.ts"), content: "needle\n" }, undefined, undefined, { cwd: dir });
+
+		const countResult = await grep!.execute(
+			"3",
+			{ pattern: "needle", path: join(dir, "src"), glob: "*.ts", limit: 10, mode: "count" },
+			undefined,
+			undefined,
+			{ cwd: dir },
+		);
+		assert.match(extractText(countResult), /a\.ts: 2/);
+		assert.match(extractText(countResult), /b\.ts: 1/);
+
+		const filesResult = await grep!.execute(
+			"4",
+			{ pattern: "needle", path: join(dir, "src"), glob: "*.ts", limit: 10, mode: "filesWithMatches" },
+			undefined,
+			undefined,
+			{ cwd: dir },
+		);
+		assert.match(extractText(filesResult), /a\.ts/);
+		assert.match(extractText(filesResult), /b\.ts/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
 test("registered native bash keeps session state across calls", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-tools-native-bash-"));
 	try {
@@ -207,6 +289,26 @@ test("registered native bash keeps session state across calls", async () => {
 		const first = await bash!.execute("1", { command: "cd .. && pwd" }, undefined, undefined, { cwd: dir });
 		const second = await bash!.execute("2", { command: "pwd" }, undefined, undefined, { cwd: dir });
 		assert.equal(extractText(second).trim(), extractText(first).trim());
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("registered native bash supports session controls", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-native-bash-session-controls-"));
+	try {
+		const pi = createPiStub();
+		extension(pi as any);
+		const bash = pi.tools.get("bash");
+		assert.ok(bash);
+
+		await bash!.execute("1", { command: "cd .. && pwd", session: false }, undefined, undefined, { cwd: dir });
+		const noSession = await bash!.execute("2", { command: "pwd", session: false }, undefined, undefined, { cwd: dir });
+		assert.equal(extractText(noSession).trim(), dir);
+
+		await bash!.execute("3", { command: "cd .." }, undefined, undefined, { cwd: dir });
+		const reset = await bash!.execute("4", { command: "pwd", resetSession: true }, undefined, undefined, { cwd: dir });
+		assert.equal(extractText(reset).trim(), dir);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
