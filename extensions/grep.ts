@@ -17,7 +17,6 @@ const builtInGrep = createGrepToolDefinition(process.cwd());
 const DEFAULT_LIMIT = 100;
 const SEARCH_TIMEOUT_MS = 30_000;
 const GREP_MAX_LINE_LENGTH = 500; // ponytail: match pi built-in truncate width without depending on an internal runtime export
-const STREAM_UPDATE_EVERY = 10; // ponytail: grep matches can be chatty, batch updates a bit
 const grepSchema = Type.Object(
 	{
 		pattern: Type.String({ description: "Search pattern (regex or literal string)" }),
@@ -157,20 +156,6 @@ function buildGrepResponse(
 	return { content: [{ type: "text", text }], details: Object.keys(details).length > 0 ? details : undefined };
 }
 
-function emitGrepUpdate(
-	onUpdate: ((update: GrepUpdate) => void) | undefined,
-	mode: GrepMode,
-	matches: GrepMatch[],
-	isDirectory: boolean,
-	searchPath: string,
-	contextValue: number,
-	force = false,
-): void {
-	if (!onUpdate || mode !== "content" || matches.length === 0) return;
-	if (!force && matches.length !== 1 && matches.length % STREAM_UPDATE_EVERY !== 0) return;
-	onUpdate(buildGrepResponse(mode, matches, isDirectory, searchPath, contextValue));
-}
-
 export async function executeGrepNative(
 	pattern: string,
 	searchDir: string | undefined,
@@ -196,7 +181,6 @@ export async function executeGrepNative(
 	const contextValue = context && context > 0 ? context : 0;
 	const effectiveLimit = Math.max(1, limit ?? DEFAULT_LIMIT);
 	const nativePattern = literal ? escapeRegex(pattern) : pattern;
-	const streamedMatches: GrepMatch[] = [];
 
 	let result;
 	try {
@@ -218,8 +202,6 @@ export async function executeGrepNative(
 			},
 			(error, match) => {
 				if (error || !match) return;
-				streamedMatches.push(match);
-				emitGrepUpdate(onUpdate, grepMode, streamedMatches, isDirectory, searchPath, contextValue);
 			},
 		);
 	} catch (err) {
@@ -236,7 +218,6 @@ export async function executeGrepNative(
 		return { content: [{ type: "text", text: "No matches found" }], details: undefined };
 	}
 
-	emitGrepUpdate(onUpdate, grepMode, result.matches, isDirectory, searchPath, contextValue, true);
 	return buildGrepResponse(grepMode, result.matches, isDirectory, searchPath, contextValue, result, effectiveLimit);
 }
 

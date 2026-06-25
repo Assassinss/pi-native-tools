@@ -13,7 +13,6 @@ import { normalizePath } from "./shared.ts";
 
 const builtInFind = createFindToolDefinition(process.cwd());
 const DEFAULT_LIMIT = 1000;
-const STREAM_UPDATE_EVERY = 25; // ponytail: first match updates immediately, then every 25 matches to avoid UI spam
 
 type FindUpdate = { content: Array<{ type: "text"; text: string }>; details?: FindToolDetails };
 
@@ -46,16 +45,6 @@ function buildFindResponse(relativePaths: string[], totalMatches?: number, effec
 	return { content: [{ type: "text", text }], details: Object.keys(details).length > 0 ? details : undefined };
 }
 
-function emitFindUpdate(
-	onUpdate: ((update: FindUpdate) => void) | undefined,
-	relativePaths: string[],
-	force = false,
-): void {
-	if (!onUpdate || relativePaths.length === 0) return;
-	if (!force && relativePaths.length !== 1 && relativePaths.length % STREAM_UPDATE_EVERY !== 0) return;
-	onUpdate(buildFindResponse(relativePaths));
-}
-
 export async function executeFindNative(
 	pattern: string,
 	searchDir: string | undefined,
@@ -84,7 +73,6 @@ export async function executeFindNative(
 		throw new Error(`Path is not a directory: ${searchPath}`);
 	}
 
-	const streamedPaths: string[] = [];
 	const result = await glob(
 		{
 			pattern,
@@ -99,8 +87,6 @@ export async function executeFindNative(
 		},
 		(error, match) => {
 			if (error || !match?.path || isIgnoredDefaultPath(match.path)) return;
-			streamedPaths.push(formatMatchPath(match.path, match.fileType));
-			emitFindUpdate(onUpdate, streamedPaths);
 		},
 	);
 	const relativePaths = result.matches
@@ -111,7 +97,6 @@ export async function executeFindNative(
 		return { content: [{ type: "text", text: "No files found matching pattern" }], details: undefined };
 	}
 
-	emitFindUpdate(onUpdate, relativePaths, true);
 	return buildFindResponse(relativePaths, result.totalMatches, effectiveLimit);
 }
 

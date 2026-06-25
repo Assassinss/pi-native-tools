@@ -196,51 +196,6 @@ test("registered native find and grep work end-to-end", async () => {
 	}
 });
 
-test("registered native find and grep stream progress updates", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-tools-native-stream-updates-"));
-	try {
-		const pi = createPiStub();
-		extension(pi as any);
-		const write = pi.tools.get("write");
-		const find = pi.tools.get("find");
-		const grep = pi.tools.get("grep");
-		assert.ok(write);
-		assert.ok(find);
-		assert.ok(grep);
-
-		await write!.execute("1", { path: join(dir, "src", "a.ts"), content: "needle\n" }, undefined, undefined, { cwd: dir });
-		await write!.execute("2", { path: join(dir, "src", "b.ts"), content: "needle\n" }, undefined, undefined, { cwd: dir });
-
-		const findUpdates: string[] = [];
-		await find!.execute(
-			"3",
-			{ pattern: "*.ts", path: join(dir, "src") },
-			undefined,
-			(update) => {
-				findUpdates.push(extractText(update as any));
-			},
-			{ cwd: dir },
-		);
-		assert.ok(findUpdates.length >= 1);
-		assert.match(findUpdates[0] ?? "", /\.ts/);
-
-		const grepUpdates: string[] = [];
-		await grep!.execute(
-			"4",
-			{ pattern: "needle", path: join(dir, "src"), glob: "*.ts", limit: 10 },
-			undefined,
-			(update) => {
-				grepUpdates.push(extractText(update as any));
-			},
-			{ cwd: dir },
-		);
-		assert.ok(grepUpdates.length >= 1);
-		assert.match(grepUpdates[0] ?? "", /needle/);
-	} finally {
-		await rm(dir, { recursive: true, force: true });
-	}
-});
-
 test("registered native grep supports count and filesWithMatches modes", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-tools-native-grep-modes-"));
 	try {
