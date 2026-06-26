@@ -19,10 +19,114 @@ import { shortHash } from "../extensions/shared.ts";
 import { executeFindNative } from "../extensions/find.ts";
 import { executeGrepNative } from "../extensions/grep.ts";
 import { clearBashSessions, executeBashNative, getBashSessionCount } from "../extensions/bash.ts";
+import { evaluateRuns } from "../scripts/eval-tool-calls.ts";
+import { convertRunsInput, formatRunsJsonl } from "../scripts/convert-tool-call-runs.ts";
 
 function extractText(result: { content: Array<{ type: string; text: string }> }): string {
 	return result.content.map((item) => item.text).join("\n");
 }
+
+test("evaluateRuns scores pass soft fail and bash overuse", () => {
+	const summary = evaluateRuns(
+		[
+			{
+				id: "pass",
+				prompt: "find tests",
+				expectedTools: ["find"],
+				argChecks: [{ path: "pattern", equals: "**/*.test.ts" }],
+			},
+			{
+				id: "soft",
+				prompt: "search createServer",
+				expectedTools: ["grep"],
+				forbiddenTools: ["bash"],
+			},
+			{
+				id: "fail",
+				prompt: "open package.json",
+				expectedTools: ["read"],
+				forbiddenTools: ["bash"],
+			},
+		],
+		[
+			{ id: "pass", toolCalls: [{ tool: "find", args: { pattern: "**/*.test.ts" } }] },
+			{ id: "soft", toolCalls: [{ tool: "find", args: { pattern: "**/*.ts" } }, { tool: "grep", args: { pattern: "createServer" } }] },
+			{ id: "fail", toolCalls: [{ tool: "bash", args: { command: "cat package.json" } }] },
+		],
+	);
+
+	assert.equal(summary.totalCases, 3);
+	assert.equal(summary.overallPassCount, 1);
+	assert.equal(summary.softPassCount, 1);
+	assert.equal(summary.failCount, 1);
+	assert.equal(summary.firstToolPassCount, 1);
+	assert.equal(summary.bashOveruseCount, 1);
+	assert.equal(summary.confusionMatrix.find?.find, 1);
+	assert.equal(summary.confusionMatrix.grep?.find, 1);
+	assert.equal(summary.confusionMatrix.read?.bash, 1);
+});
+
+test("sample tool-call eval corpus covers real tool selection confusions", async () => {
+	const cases = (await readFile("evals/tool-calls.jsonl", "utf-8"))
+		.trim()
+		.split(/\r?\n/)
+		.filter(Boolean)
+		.map((line) => JSON.parse(line) as { id: string; expectedTools?: string[]; expectedSequence?: string[]; tags?: string[]; forbiddenTools?: string[]; argChecks?: Array<{ path: string }> });
+	const results = (await readFile("evals/tool-calls.sample-results.jsonl", "utf-8"))
+		.trim()
+		.split(/\r?\n/)
+		.filter(Boolean)
+		.map((line) => JSON.parse(line) as { id: string });
+
+	assert.ok(cases.length >= 15);
+	assert.ok(cases.some((evalCase) => evalCase.id === "read-readme"));
+	assert.ok(cases.some((evalCase) => evalCase.id === "grep-files-only"));
+	assert.ok(cases.some((evalCase) => evalCase.id === "grep-count"));
+	assert.ok(cases.some((evalCase) => evalCase.id === "find-markdown"));
+	assert.ok(cases.some((evalCase) => evalCase.id === "bash-git-status"));
+	assert.ok(cases.some((evalCase) => evalCase.id === "write-new-file"));
+	assert.ok(cases.some((evalCase) => evalCase.id === "edit-direct-replace"));
+	assert.ok(cases.some((evalCase) => evalCase.expectedSequence?.join(",") === "read,edit"));
+	assert.ok(cases.some((evalCase) => evalCase.expectedTools?.[0] === "read" && evalCase.forbiddenTools?.includes("bash")));
+	assert.ok(cases.some((evalCase) => evalCase.expectedTools?.[0] === "grep" && evalCase.argChecks?.some((check) => check.path === "mode")));
+	assert.deepEqual(
+		new Set(results.map((run) => run.id)),
+		new Set(cases.map((evalCase) => evalCase.id)),
+	);
+});
+
+test("convertRunsInput normalizes common raw tool call shapes", () => {
+	const runs = convertRunsInput({
+		runs: [
+			{
+				caseId: "a",
+				tool_calls: [{ function: { name: "find", arguments: '{"pattern":"**/*.ts"}' } }],
+				status: "ok",
+			},
+			{
+				caseId: "b",
+				toolCalls: [{ tool: "grep", args: { pattern: "fetchUser(", literal: true } }],
+			},
+			{
+				caseId: "c",
+				calls: [
+					{ name: "read", input: { path: "src/file.ts", withHashlines: true } },
+					{ name: "edit", parameters: { edits: [{ hashline: "2:deadbeef", newText: "SECOND" }] } },
+				],
+			},
+		],
+	});
+
+	assert.equal(runs.length, 3);
+	assert.equal(runs[0]?.toolCalls[0]?.tool, "find");
+	assert.deepEqual(runs[0]?.toolCalls[0]?.args, { pattern: "**/*.ts" });
+	assert.equal(runs[1]?.toolCalls[0]?.tool, "grep");
+	assert.deepEqual(runs[1]?.toolCalls[0]?.args, { pattern: "fetchUser(", literal: true });
+	assert.equal(runs[2]?.toolCalls[0]?.tool, "read");
+	assert.equal(runs[2]?.toolCalls[1]?.tool, "edit");
+	assert.match(formatRunsJsonl(runs), /"id":"a"/);
+});
+
 
 test("parseHashline parses valid anchor", () => {
 	assert.deepEqual(parseHashline("42:deadbeef"), { line: 42, hash: "deadbeef" });
@@ -104,7 +208,13 @@ test("applyHashlineEdits inserts after anchored line", () => {
 test("applyHashlineEdits rejects hash mismatch", () => {
 	assert.throws(
 		() => applyHashlineEdits("a\nb", [{ hashline: "2:deadbeef", newText: "B" }], "a.txt"),
-		/hashline mismatch/,
+		(error: unknown) => {
+			assert.ok(error instanceof Error);
+			assert.match(error.message, /^TOOL_ERROR /);
+			assert.match(error.message, /"code":"hashline_mismatch"/);
+			assert.match(error.message, /hashline mismatch/);
+			return true;
+		},
 	);
 });
 
@@ -177,6 +287,28 @@ test("validateEditInput separates text and hashline edits", () => {
 	assert.equal(validated.hashlineEdits.length, 1);
 });
 
+test("validateEditInput rejects edits with both oldText and hashline", () => {
+	assert.throws(
+		() =>
+			validateEditInput({
+				path: "a.txt",
+				edits: [{ oldText: "a", hashline: `1:${shortHash("a")}`, newText: "b" }],
+			}),
+		/both hashline and oldText/,
+	);
+});
+
+test("validateEditInput rejects edits without oldText or hashline", () => {
+	assert.throws(
+		() =>
+			validateEditInput({
+				path: "a.txt",
+				edits: [{ newText: "b" }],
+			}),
+		/either oldText .* or hashline/,
+	);
+});
+
 test("executeRead reads offset/limit and hashlines", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-tools-read-"));
 	try {
@@ -202,6 +334,26 @@ test("executeRead includes a stable trailing empty line in hashline mode", async
 		assert.match(text, /^1:[a-f0-9]{8}\|one/m);
 		assert.match(text, /^2:[a-f0-9]{8}\|two/m);
 		assert.match(text, /^3:[a-f0-9]{8}\|$/m);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeRead returns structured offset_out_of_range errors", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-read-oob-"));
+	try {
+		const file = join(dir, "sample.txt");
+		await writeFile(file, "one\ntwo\n", "utf-8");
+		await assert.rejects(
+			executeRead(file, 99, undefined, false, undefined, dir),
+			(error: unknown) => {
+				assert.ok(error instanceof Error);
+				assert.match(error.message, /^TOOL_ERROR /);
+				assert.match(error.message, /"code":"offset_out_of_range"/);
+				assert.match(error.message, /Offset 99 is beyond end of file/);
+				return true;
+			},
+		);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
@@ -315,6 +467,25 @@ test("executeFindNative does not report result limit when total matches equal li
 	}
 });
 
+test("executeFindNative returns structured path_not_found errors", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-find-missing-"));
+	try {
+		const missing = join(dir, "missing-dir");
+		await assert.rejects(
+			executeFindNative("*.ts", missing, 10, dir, undefined),
+			(error: unknown) => {
+				assert.ok(error instanceof Error);
+				assert.match(error.message, /^TOOL_ERROR /);
+				assert.match(error.message, /"code":"path_not_found"/);
+				assert.match(error.message, /Path not found:/);
+				return true;
+			},
+		);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
 test("executeWrite invalidates native scan cache", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-tools-write-cache-"));
 	try {
@@ -327,6 +498,29 @@ test("executeWrite invalidates native scan cache", async () => {
 		const text = extractText(result);
 		assert.match(text, /a\.ts/);
 		assert.match(text, /b\.ts/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeWrite returns structured write_failed errors", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-write-fail-"));
+	try {
+		const target = join(dir, "existing-dir");
+		await writeFile(join(target, ".keep"), "x", "utf-8").catch(async () => {
+			await rm(target, { recursive: true, force: true });
+			await executeWrite(join(target, ".keep"), "x", undefined, dir);
+		});
+		await assert.rejects(
+			executeWrite(target, "nope", undefined, dir),
+			(error: unknown) => {
+				assert.ok(error instanceof Error);
+				assert.match(error.message, /^TOOL_ERROR /);
+				assert.match(error.message, /"code":"write_failed"/);
+				assert.match(error.message, /Failed to write/);
+				return true;
+			},
+		);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
@@ -354,6 +548,24 @@ test("executeGrepNative escapes literals", async () => {
 		await writeFile(file, "fetchAnthropicProvider(\nother\n", "utf-8");
 		const result = await executeGrepNative("fetchAnthropicProvider(", undefined, undefined, false, true, 0, 10, dir, undefined, undefined);
 		assert.match(extractText(result), /sample\.txt:1: fetchAnthropicProvider\(/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeGrepNative returns structured invalid regex errors", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-grep-invalid-regex-"));
+	try {
+		await assert.rejects(
+			executeGrepNative("[", undefined, undefined, false, false, 0, 10, dir, undefined, undefined),
+			(error: unknown) => {
+				assert.ok(error instanceof Error);
+				assert.match(error.message, /^TOOL_ERROR /);
+				assert.match(error.message, /"code":"invalid_regex"/);
+				assert.match(error.message, /Invalid regex:/);
+				return true;
+			},
+		);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
@@ -444,6 +656,8 @@ test("executeBashNative preserves streamed output in thrown errors", async () =>
 			executeBashNative("echo before-fail && exit 7", dir, undefined, undefined),
 			(error: unknown) => {
 				assert.ok(error instanceof Error);
+				assert.match(error.message, /^TOOL_ERROR /);
+				assert.match(error.message, /"code":"command_failed"/);
 				assert.match(error.message, /before-fail/);
 				assert.match(error.message, /Command exited with code 7/);
 				return true;

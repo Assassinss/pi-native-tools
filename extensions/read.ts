@@ -17,12 +17,17 @@ import {
 	stat,
 	throwIfAborted,
 	truncateHead,
+	toolError,
 } from "./shared.ts";
+
+function readError(code: string, message: string, hint?: string, details?: Record<string, unknown>): Error {
+	return toolError({ tool: "read", code, message, hint, details, retryable: code !== "offset_out_of_range" });
+}
 
 const readSchema = Type.Object({
 	path: Type.String({ description: "Path to the file to read (relative or absolute)" }),
-	offset: Type.Optional(Type.Number({ description: "Line number to start reading from (1-indexed)" })),
-	limit: Type.Optional(Type.Number({ description: "Maximum number of lines to read" })),
+	offset: Type.Optional(Type.Integer({ minimum: 1, description: "Line number to start reading from (1-indexed). Must be >= 1." })),
+	limit: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum number of lines to read. Must be >= 1." })),
 	withHashlines: Type.Optional(
 		Type.Boolean({
 			description:
@@ -45,7 +50,7 @@ export async function executeReadStreaming(
 
 	return new Promise((resolve, reject) => {
 		if (signal?.aborted) {
-			reject(new Error("Operation aborted"));
+			reject(readError("aborted", "Operation aborted", "Retry the read if cancellation was unintended.", { path: originalPath }));
 			return;
 		}
 
@@ -55,7 +60,7 @@ export async function executeReadStreaming(
 
 		const onAbort = () => {
 			readStream.destroy();
-			reject(new Error("Operation aborted"));
+			reject(readError("aborted", "Operation aborted", "Retry the read if cancellation was unintended.", { path: originalPath }));
 		};
 		signal?.addEventListener("abort", onAbort, { once: true });
 
@@ -109,7 +114,7 @@ export async function executeReadStreaming(
 
 		readStream.on("error", (err) => {
 			signal?.removeEventListener("abort", onAbort);
-			reject(new Error(`Stream error reading ${originalPath}: ${err.message}`));
+			reject(readError("stream_read_failed", `Stream error reading ${originalPath}: ${err.message}`, undefined, { path: originalPath }));
 		});
 
 		function finalize() {
@@ -168,7 +173,12 @@ export async function executeRead(
 	const totalFileLines = allLines.length;
 	const startLine = offset ? Math.max(0, offset - 1) : 0;
 	if (startLine >= allLines.length) {
-		throw new Error(`Offset ${offset} is beyond end of file (${allLines.length} lines total)`);
+		throw readError(
+			"offset_out_of_range",
+			`Offset ${offset} is beyond end of file (${allLines.length} lines total)`,
+			"Use a smaller offset or reread the file from the beginning.",
+			{ path, offset, totalLines: allLines.length },
+		);
 	}
 
 	const selectedLines = limit !== undefined ? allLines.slice(startLine, startLine + limit) : allLines.slice(startLine);
@@ -203,6 +213,8 @@ export function registerReadTool(pi: ExtensionAPI): void {
 		promptGuidelines: [
 			"Use read to examine files instead of bash cat.",
 			"Use withHashlines=true before editing to capture line hashes for safe hashline-anchored edits.",
+			"Example: 'open src/app.ts' -> use read with the file path.",
+			"Example: 'change line 42 safely' -> use read withHashlines=true first, then pass the returned hashline to edit.",
 		],
 		parameters: readSchema,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {

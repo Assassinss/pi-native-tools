@@ -76,12 +76,43 @@ export async function ensureReadable(path: string, absolutePath: string): Promis
 	try {
 		await access(absolutePath, constants.R_OK);
 	} catch (err: any) {
-		if (err.code === "ENOENT") throw new Error(`File not found: ${path}`);
-		if (err.code === "EACCES") throw new Error(`Permission denied: ${path}`);
-		throw new Error(`Cannot access file: ${path}. ${err.message}`);
+		if (err.code === "ENOENT") {
+			throw toolError({ tool: "read", code: "file_not_found", message: `File not found: ${path}`, hint: "Check the path and retry.", details: { path } });
+		}
+		if (err.code === "EACCES") {
+			throw toolError({ tool: "read", code: "permission_denied", message: `Permission denied: ${path}`, hint: "Choose a readable path or adjust permissions.", details: { path } });
+		}
+		throw toolError({ tool: "read", code: "read_failed", message: `Cannot access file: ${path}. ${err.message}`, details: { path } });
 	}
 }
 
+export type ToolErrorPayload = {
+	tool: string;
+	code: string;
+	message: string;
+	retryable?: boolean;
+	hint?: string;
+	details?: Record<string, unknown>;
+};
+
+export function formatToolError(payload: ToolErrorPayload): string {
+	const structured = {
+		tool: payload.tool,
+		code: payload.code,
+		message: payload.message,
+		retryable: payload.retryable ?? false,
+		...(payload.hint ? { hint: payload.hint } : {}),
+		...(payload.details ? { details: payload.details } : {}),
+	};
+	return `TOOL_ERROR ${JSON.stringify(structured)}\n${payload.message}`;
+}
+
+export function toolError(payload: ToolErrorPayload): Error {
+	return new Error(formatToolError(payload));
+}
+
 export function throwIfAborted(signal: AbortSignal | undefined): void {
-	if (signal?.aborted) throw new Error("Operation aborted");
+	if (signal?.aborted) {
+		throw toolError({ tool: "shared", code: "aborted", message: "Operation aborted", retryable: true });
+	}
 }

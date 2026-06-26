@@ -1,0 +1,21 @@
+{
+  "runs": [
+    {
+      "caseId": "replace-with-eval-case-id",
+      "toolCalls": [
+        {
+          "tool": "grep",
+          "args": {
+            "pattern": "example",
+            "literal": true
+          }
+        }
+      ],
+      "finalOutcome": "ok",
+      "metadata": {
+        "model": "optional-model-name",
+        "note": "optional-note"
+      }
+    }
+  ]
+}

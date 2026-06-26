@@ -14,7 +14,12 @@ import {
 	stat,
 	throwIfAborted,
 	withFileMutationQueue,
+	toolError,
 } from "./shared.ts";
+
+function writeError(code: string, message: string, hint?: string, details?: Record<string, unknown>): Error {
+	return toolError({ tool: "write", code, message, hint, details });
+}
 import { createHash } from "node:crypto";
 import { invalidateFsScanCache } from "./omp-native.ts";
 
@@ -52,8 +57,10 @@ export async function executeWrite(
 	try {
 		await mkdir(dir, { recursive: true });
 	} catch (err: any) {
-		if (err.code === "EACCES") throw new Error(`Permission denied creating directory: ${dir}`);
-		throw new Error(`Failed to create directory ${dir}: ${err.message}`);
+		if (err.code === "EACCES") {
+			throw writeError("permission_denied_directory", `Permission denied creating directory: ${dir}`, "Choose a writable parent directory or adjust permissions.", { path: dir });
+		}
+		throw writeError("mkdir_failed", `Failed to create directory ${dir}: ${err.message}`, undefined, { path: dir });
 	}
 
 	throwIfAborted(signal);
@@ -66,9 +73,13 @@ export async function executeWrite(
 			try {
 				await fsWriteFile(absolutePath, contentBuffer);
 			} catch (err: any) {
-				if (err.code === "EACCES") throw new Error(`Permission denied writing: ${path}`);
-				if (err.code === "ENOSPC") throw new Error(`Disk full: cannot write ${formatSize(contentSize)} to ${path}`);
-				throw new Error(`Failed to write ${path}: ${err.message}`);
+				if (err.code === "EACCES") {
+					throw writeError("permission_denied_write", `Permission denied writing: ${path}`, "Choose a writable path or adjust permissions.", { path });
+				}
+				if (err.code === "ENOSPC") {
+					throw writeError("disk_full", `Disk full: cannot write ${formatSize(contentSize)} to ${path}`, "Free disk space and retry the write.", { path, sizeBytes: contentSize });
+				}
+				throw writeError("write_failed", `Failed to write ${path}: ${err.message}`, undefined, { path });
 			}
 			throwIfAborted(signal);
 			const writtenStat = await stat(absolutePath);
@@ -97,15 +108,15 @@ export async function executeWrite(
 
 			const onAbort = () => {
 				writeStream.destroy();
-				reject(new Error("Operation aborted"));
+				reject(writeError("aborted", "Operation aborted", "Retry the write if cancellation was unintended.", { path }));
 			};
 			signal?.addEventListener("abort", onAbort, { once: true });
 
 			writeStream.on("error", (err: NodeJS.ErrnoException) => {
 				signal?.removeEventListener("abort", onAbort);
-				if (err.code === "EACCES") reject(new Error(`Permission denied writing: ${path}`));
-				else if (err.code === "ENOSPC") reject(new Error(`Disk full: streaming write failed for ${path}`));
-				else reject(new Error(`Streaming write failed for ${path}: ${err.message}`));
+				if (err.code === "EACCES") reject(writeError("permission_denied_write", `Permission denied writing: ${path}`, "Choose a writable path or adjust permissions.", { path }));
+				else if (err.code === "ENOSPC") reject(writeError("disk_full", `Disk full: streaming write failed for ${path}`, "Free disk space and retry the write.", { path }));
+				else reject(writeError("stream_write_failed", `Streaming write failed for ${path}: ${err.message}`, undefined, { path }));
 			});
 
 			writeStream.on("finish", async () => {
@@ -115,8 +126,11 @@ export async function executeWrite(
 					const writtenStat = await stat(absolutePath);
 					if (writtenStat.size !== contentSize) {
 						reject(
-							new Error(
+							writeError(
+								"verification_failed",
 								`Write verification failed for ${path}: expected ${contentSize} bytes, got ${writtenStat.size} bytes. File may be corrupt.`,
+								"Retry the write and inspect the filesystem if the mismatch persists.",
+								{ path, expectedSize: contentSize, actualSize: writtenStat.size },
 							),
 						);
 						return;
@@ -132,7 +146,7 @@ export async function executeWrite(
 						details: { size: writtenStat.size, hash: fileHash },
 					});
 				} catch (err: any) {
-					reject(new Error(`Write verification failed for ${path}: ${err.message}`));
+					reject(writeError("verification_failed", `Write verification failed for ${path}: ${err.message}`, undefined, { path }));
 				}
 			});
 

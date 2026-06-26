@@ -9,7 +9,11 @@ import {
 import { FileType, glob } from "./omp-native.ts";
 import path, { basename } from "node:path";
 import { lstat } from "node:fs/promises";
-import { normalizePath } from "./shared.ts";
+import { normalizePath, toolError } from "./shared.ts";
+
+function findError(code: string, message: string, hint?: string, details?: Record<string, unknown>): Error {
+	return toolError({ tool: "find", code, message, hint, details });
+}
 
 const builtInFind = createFindToolDefinition(process.cwd());
 const DEFAULT_LIMIT = 1000;
@@ -60,7 +64,7 @@ export async function executeFindNative(
 	try {
 		searchStat = await lstat(searchPath);
 	} catch {
-		throw new Error(`Path not found: ${searchPath}`);
+		throw findError("path_not_found", `Path not found: ${searchPath}`, "Check the search path and retry.", { path: searchPath });
 	}
 
 	if (searchStat.isFile()) {
@@ -70,7 +74,7 @@ export async function executeFindNative(
 		return { content: [{ type: "text", text: matches[0] }], details: undefined };
 	}
 	if (!searchStat.isDirectory()) {
-		throw new Error(`Path is not a directory: ${searchPath}`);
+		throw findError("path_not_directory", `Path is not a directory: ${searchPath}`, "Pass a directory path when searching recursively.", { path: searchPath });
 	}
 
 	const result = await glob(
@@ -103,6 +107,16 @@ export async function executeFindNative(
 export function registerFindTool(pi: ExtensionAPI): void {
 	pi.registerTool({
 		...builtInFind,
+		description:
+			"Find file and directory paths by glob pattern. Use this when you need candidate paths by name or location only. Prefer grep when searching file contents, read when opening a known file, and bash only for shell-specific tasks. Respects .gitignore and returns workspace-relative paths.",
+		promptSnippet: "Find file paths by glob before reading or searching file contents",
+		promptGuidelines: [
+			"Use find when the task is about locating files or directories by path, extension, or naming pattern.",
+			"Prefer grep for searching inside files and read for opening a specific file.",
+			"Do not use bash ls/find for routine file discovery when this tool can answer directly.",
+			"Example: 'find all *.test.ts files' -> use find with pattern='**/*.test.ts'.",
+			"Example: 'which file defines UserController' -> use grep first because the question is about file contents, not file names.",
+		],
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const { pattern, path: searchDir, limit } = params as { pattern: string; path?: string; limit?: number };
 			return executeFindNative(pattern, searchDir, limit, ctx?.cwd ?? process.cwd(), signal, onUpdate as any);

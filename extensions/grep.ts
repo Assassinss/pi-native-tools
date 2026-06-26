@@ -11,7 +11,11 @@ import { Type } from "typebox";
 import { GrepOutputMode, grep, type GrepMatch } from "./omp-native.ts";
 import { basename } from "node:path";
 import { stat } from "node:fs/promises";
-import { normalizePath } from "./shared.ts";
+import { normalizePath, toolError } from "./shared.ts";
+
+function grepError(code: string, message: string, hint?: string, details?: Record<string, unknown>): Error {
+	return toolError({ tool: "grep", code, message, hint, details });
+}
 
 const builtInGrep = createGrepToolDefinition(process.cwd());
 const DEFAULT_LIMIT = 100;
@@ -19,20 +23,20 @@ const SEARCH_TIMEOUT_MS = 30_000;
 const GREP_MAX_LINE_LENGTH = 500; // ponytail: match pi built-in truncate width without depending on an internal runtime export
 const grepSchema = Type.Object(
 	{
-		pattern: Type.String({ description: "Search pattern (regex or literal string)" }),
+		pattern: Type.String({ description: "Search pattern (regex by default, or exact text when literal=true). Use for code/content search, not path discovery." }),
 		path: Type.Optional(Type.String({ description: "Directory or file to search (default: current directory)" })),
-		glob: Type.Optional(Type.String({ description: "Filter files by glob pattern, e.g. '*.ts' or '**/*.spec.ts'" })),
+		glob: Type.Optional(Type.String({ description: "Optional file filter such as '*.ts' or '**/*.spec.ts'. Applies after choosing the search path." })),
 		ignoreCase: Type.Optional(Type.Boolean({ description: "Case-insensitive search (default: false)" })),
-		literal: Type.Optional(Type.Boolean({ description: "Treat pattern as literal string instead of regex (default: false)" })),
-		context: Type.Optional(Type.Number({ description: "Number of lines to show before and after each match (default: 0)" })),
-		limit: Type.Optional(Type.Number({ description: "Maximum number of matches to return (default: 100)" })),
+		literal: Type.Optional(Type.Boolean({ description: "Treat pattern as literal text instead of regex. Prefer true for exact strings containing regex characters like ()[]?." })),
+		context: Type.Optional(Type.Integer({ minimum: 0, description: "Number of lines to show before and after each match (default: 0). Must be >= 0." })),
+		limit: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum number of matches to return (default: 100). Must be >= 1." })),
 		mode: Type.Optional(
 			Type.Union([
 				Type.Literal("content"),
 				Type.Literal("count"),
 				Type.Literal("filesWithMatches"),
 			], {
-				description: "Output mode: content (default), count, or filesWithMatches",
+				description: "Output mode: content for matching lines, count for per-file match totals, or filesWithMatches for path-only results.",
 			}),
 		),
 	},
@@ -174,7 +178,7 @@ export async function executeGrepNative(
 	try {
 		isDirectory = (await stat(searchPath)).isDirectory();
 	} catch {
-		throw new Error(`Path not found: ${searchPath}`);
+		throw grepError("path_not_found", `Path not found: ${searchPath}`, "Check the search path and retry.", { path: searchPath });
 	}
 
 	const grepMode = mode ?? "content";
@@ -206,10 +210,16 @@ export async function executeGrepNative(
 		);
 	} catch (err) {
 		if (err instanceof Error && /^regex(?: parse)? error/i.test(err.message)) {
-			throw new Error(err.message.replace(/^regex(?: parse)? error:?\s*/i, "Invalid regex: "));
+			const message = err.message.replace(/^regex(?: parse)? error:?\s*/i, "Invalid regex: ");
+			throw grepError("invalid_regex", message, "Use literal=true for exact text or fix the regex syntax.", { pattern, literal: Boolean(literal) });
 		}
 		if (err instanceof Error && err.message.includes("Aborted: Timeout")) {
-			throw new Error(`Search timed out after ${SEARCH_TIMEOUT_MS / 1000}s; narrow paths or pattern`);
+			throw grepError(
+				"search_timeout",
+				`Search timed out after ${SEARCH_TIMEOUT_MS / 1000}s; narrow paths or pattern`,
+				"Reduce the search path, add a glob filter, or make the pattern more specific.",
+				{ path: searchPath, pattern },
+			);
 		}
 		throw err;
 	}
@@ -224,6 +234,16 @@ export async function executeGrepNative(
 export function registerGrepTool(pi: ExtensionAPI): void {
 	pi.registerTool({
 		...builtInGrep,
+		description:
+			"Search file contents by regex or literal pattern. Use this when you need matching lines, counts, or files with matches. Prefer find for path discovery, read for full file inspection, and bash only for shell-specific tasks. Respects .gitignore and truncates long lines in output.",
+		promptSnippet: "Search file contents without falling back to bash grep",
+		promptGuidelines: [
+			"Use grep to search inside files for symbols, strings, or patterns across a path.",
+			"Prefer literal=true when searching for exact text that may contain regex characters.",
+			"Prefer find for locating paths and read for viewing full file contents.",
+			"Example: 'search for fetchUser(' -> use grep with literal=true because parentheses are regex characters.",
+			"Example: 'show me the whole package.json' -> use read, not grep, because the user wants full file contents.",
+		],
 		parameters: grepSchema,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const { pattern, path: searchDir, glob, ignoreCase, literal, context, limit, mode } = params as {
@@ -252,3 +272,4 @@ export function registerGrepTool(pi: ExtensionAPI): void {
 		},
 	});
 }
+

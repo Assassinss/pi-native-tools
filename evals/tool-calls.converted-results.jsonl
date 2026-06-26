@@ -1,0 +1,3 @@
+{"id":"find-tests","toolCalls":[{"tool":"find","args":{"pattern":"**/*.test.ts"}}],"finalOutcome":"ok"}
+{"id":"grep-literal","toolCalls":[{"tool":"grep","args":{"pattern":"fetchUser(","literal":true}}],"finalOutcome":"ok"}
+{"id":"edit-hashline-flow","toolCalls":[{"tool":"read","args":{"path":"src/file.ts","withHashlines":true}},{"tool":"edit","args":{"path":"src/file.ts","edits":[{"hashline":"2:deadbeef","newText":"SECOND"}]}}],"metadata":{"model":"demo"}}

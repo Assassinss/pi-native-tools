@@ -14,40 +14,51 @@ import {
 	throwIfAborted,
 	withFileMutationQueue,
 	dirname,
+	toolError,
 } from "./shared.ts";
 import { invalidateFsScanCache } from "./omp-native.ts";
 
-const replaceEditSchema = Type.Object(
+function editError(code: string, message: string, hint?: string, details?: Record<string, unknown>): Error {
+	return toolError({ tool: "edit", code, message, hint, details });
+}
+
+const textEditSchema = Type.Object(
 	{
-		oldText: Type.Optional(
-			Type.String({
-				description:
-					"Exact text to replace. Must be unique in the file. Mutually exclusive with hashline.",
-			}),
-		),
+		oldText: Type.String({
+			description:
+				"Exact text to replace. Must be unique in the file. Use this for direct text replacement when you already know the current content.",
+		}),
 		newText: Type.String({ description: "Replacement text for this targeted edit." }),
-		hashline: Type.Optional(
-			Type.String({
-				description:
-					"Hashline anchor in format 'LINE:HEX'. Verifies the line at LINE still has the expected hash before applying. Mutually exclusive with oldText. Example: '42:a1b2c3d4'",
-			}),
-		),
+	},
+	{ additionalProperties: false },
+);
+
+const hashlineEditSchema = Type.Object(
+	{
+		hashline: Type.String({
+			description:
+				"Hashline anchor in format 'LINE:HEX'. Verifies the line at LINE still has the expected hash before applying. Example: '42:a1b2c3d4'",
+		}),
+		newText: Type.String({ description: "Replacement text for this targeted edit." }),
 		wholeLine: Type.Optional(
 			Type.Boolean({
 				description:
-					"When true with hashline, the entire line content is replaced by newText. When false with hashline, newText is inserted after the anchored line. Default: true",
+					"When true, replace the anchored line. When false, insert newText after the anchored line. Default: true.",
 			}),
 		),
 	},
 	{ additionalProperties: false },
 );
 
+const replaceEditSchema = Type.Union([textEditSchema, hashlineEditSchema]);
+
 const editSchema = Type.Object(
 	{
 		path: Type.String({ description: "Path to the file to edit (relative or absolute)" }),
 		edits: Type.Array(replaceEditSchema, {
+			minItems: 1,
 			description:
-				"One or more targeted replacements. Supports text-based (oldText) or hashline-anchored edits. Each edit is matched against the original file, not incrementally.",
+				"One or more targeted replacements. Each entry must be either oldText+newText or hashline+newText. Each edit is matched against the original file, not incrementally.",
 		}),
 	},
 	{ additionalProperties: false },
@@ -154,7 +165,12 @@ function resolveUniqueMatch(content: string, candidate: string, newText: string,
 	const start = content.indexOf(candidate);
 	if (start === -1) return null;
 	if (content.indexOf(candidate, start + 1) !== -1) {
-		throw new Error(`Edit failed: oldText appears multiple times in ${filePath}. Provide more context to make it unique.`);
+		throw editError(
+			"old_text_not_unique",
+			`Edit failed: oldText appears multiple times in ${filePath}. Provide more context to make it unique.`,
+			"Use a longer oldText snippet so the match is unique within the file.",
+			{ path: filePath },
+		);
 	}
 	return { start, end: start + candidate.length, newText };
 }
@@ -177,7 +193,12 @@ function resolveTextEdit(content: string, oldText: string, newText: string, file
 		if (resolved) return resolved;
 	}
 
-	throw new Error(`Edit failed: oldText not found in ${filePath}. The text to replace must match exactly, including whitespace.`);
+	throw editError(
+		"old_text_not_found",
+		`Edit failed: oldText not found in ${filePath}. The text to replace must match exactly, including whitespace.`,
+		"Read the file again and copy the exact current text, including whitespace and line endings.",
+		{ path: filePath },
+	);
 }
 
 export function applyTextEdits(content: string, edits: Array<{ oldText: string; newText: string }>, filePath: string): string {
@@ -187,7 +208,12 @@ export function applyTextEdits(content: string, edits: Array<{ oldText: string; 
 
 	for (let i = 1; i < resolved.length; i++) {
 		if (resolved[i - 1]!.end > resolved[i]!.start) {
-			throw new Error(`Edit failed: edits overlap in ${filePath}. Merge nearby changes into one edit.`);
+			throw editError(
+				"overlapping_edits",
+				`Edit failed: edits overlap in ${filePath}. Merge nearby changes into one edit.`,
+				"Combine overlapping edits into a single replacement matched against the original file.",
+				{ path: filePath },
+			);
 		}
 	}
 
@@ -226,24 +252,38 @@ export function applyHashlineEdits(
 	for (const edit of edits) {
 		const parsed = parseHashline(edit.hashline);
 		if (!parsed) {
-			throw new Error(`Edit failed: invalid hashline format "${edit.hashline}". Expected format: LINE:${"a".repeat(HASH_SHORT_LEN)}`);
+			throw editError(
+				"invalid_hashline_format",
+				`Edit failed: invalid hashline format "${edit.hashline}". Expected format: LINE:${"a".repeat(HASH_SHORT_LEN)}`,
+				"Capture fresh hashlines with read(withHashlines=true) and pass the LINE:HASH prefix unchanged.",
+				{ hashline: edit.hashline, path: filePath },
+			);
 		}
 		const { line, hash } = parsed;
 		const lineIndex = line - 1;
 		if (lineIndex < 0 || lineIndex >= originalLines.length) {
-			throw new Error(
+			throw editError(
+				"hashline_out_of_range",
 				`Edit failed: hashline ${edit.hashline} references line ${line}, but file ${filePath} has only ${originalLines.length} lines. The file may have changed since the hashline was captured.`,
+				"Read the file again with withHashlines=true before retrying the edit.",
+				{ hashline: edit.hashline, line, totalLines: originalLines.length, path: filePath },
 			);
 		}
 		if (targetedLines.has(lineIndex)) {
-			throw new Error(
+			throw editError(
+				"duplicate_hashline_target",
 				`Edit failed: hashline ${edit.hashline} targets line ${line}, but another edit already targets this line. Merge edits targeting the same line.`,
+				"Merge changes for the same anchored line into one edit entry.",
+				{ hashline: edit.hashline, line, path: filePath },
 			);
 		}
 		if (!verifyHashline(originalLines[lineIndex], hash)) {
 			const actualHash = shortHash(originalLines[lineIndex]);
-			throw new Error(
+			throw editError(
+				"hashline_mismatch",
 				`Edit failed: hashline mismatch at line ${line}. Expected hash: ${hash}, actual: ${actualHash}.\nContent at line ${line}: ${originalLines[lineIndex]}\nThe file may have changed since the hashline was captured. Use read(withHashlines=true) to get fresh hashline data.`,
+				"Refresh the file with read(withHashlines=true) and retry using the new hashline.",
+				{ expectedHash: hash, actualHash, line, path: filePath },
 			);
 		}
 		verified.push({
@@ -278,7 +318,11 @@ export function validateEditInput(input: {
 	hashlineEdits: Array<{ hashline: string; newText: string; wholeLine?: boolean }>;
 } {
 	if (!Array.isArray(input.edits) || input.edits.length === 0) {
-		throw new Error("Edit tool input is invalid. edits must contain at least one replacement.");
+		throw editError(
+			"invalid_input",
+			"Edit tool input is invalid. edits must contain at least one replacement.",
+			"Pass edits as a non-empty array of oldText+newText or hashline+newText entries.",
+		);
 	}
 
 	const textEdits: Array<{ oldText: string; newText: string }> = [];
@@ -286,10 +330,18 @@ export function validateEditInput(input: {
 
 	for (const edit of input.edits) {
 		if (edit.hashline && edit.oldText) {
-			throw new Error("Edit failed: edit cannot have both hashline and oldText. Use one or the other.");
+			throw editError(
+				"conflicting_edit_modes",
+				"Edit failed: edit cannot have both hashline and oldText. Use one or the other.",
+				"Choose exactly one edit mode per entry: oldText+newText or hashline+newText.",
+			);
 		}
 		if (!edit.hashline && !edit.oldText) {
-			throw new Error("Edit failed: each edit must have either oldText (text match) or hashline (hashline anchor).");
+			throw editError(
+				"missing_edit_mode",
+				"Edit failed: each edit must have either oldText (text match) or hashline (hashline anchor).",
+				"Add oldText for text replacement or hashline for anchored replacement.",
+			);
 		}
 		if (edit.hashline) {
 			hashlineEdits.push({ hashline: edit.hashline, newText: edit.newText, wholeLine: edit.wholeLine });
@@ -346,6 +398,8 @@ export function registerEditTool(pi: ExtensionAPI): void {
 			"For hashline-anchored safety: use read(withHashlines=true) first to capture line hashes, then use hashline+newText to verify line positions.",
 			"Keep edits[].oldText as small as possible while still being unique in the file.",
 			"Do not emit overlapping or nested edits.",
+			"Example: after read(withHashlines=true) returns '42:deadbeef|const x = 1;', use hashline='42:deadbeef' for a safe anchored edit.",
+			"Example: if replacing a known unique snippet like 'return false;', use oldText+newText instead of hashlines.",
 		],
 		parameters: editSchema,
 		renderShell: builtInEdit.renderShell,
@@ -364,9 +418,13 @@ export function registerEditTool(pi: ExtensionAPI): void {
 					content = (await readFile(absolutePath)).toString("utf-8");
 				} catch (err: any) {
 					throwIfAborted(signal);
-					if (err.code === "ENOENT") throw new Error(`File not found: ${path}. Use write to create new files.`);
-					if (err.code === "EACCES") throw new Error(`Permission denied: ${path}`);
-					throw new Error(`Cannot access file: ${path}. Error: ${err.message}`);
+					if (err.code === "ENOENT") {
+						throw editError("file_not_found", `File not found: ${path}. Use write to create new files.`, "Create the file with write or check the path.", { path });
+					}
+					if (err.code === "EACCES") {
+						throw editError("permission_denied", `Permission denied: ${path}`, "Choose a writable path or adjust permissions.", { path });
+					}
+					throw editError("read_failed", `Cannot access file: ${path}. Error: ${err.message}`, undefined, { path });
 				}
 				throwIfAborted(signal);
 
@@ -380,9 +438,13 @@ export function registerEditTool(pi: ExtensionAPI): void {
 					await fsWriteFile(absolutePath, newContent, "utf-8");
 				} catch (err: any) {
 					throwIfAborted(signal);
-					if (err.code === "EACCES") throw new Error(`Permission denied writing: ${path}`);
-					if (err.code === "ENOSPC") throw new Error(`Disk full: cannot write to ${path}`);
-					throw new Error(`Failed to write ${path}: ${err.message}`);
+					if (err.code === "EACCES") {
+						throw editError("permission_denied_write", `Permission denied writing: ${path}`, "Choose a writable path or adjust permissions.", { path });
+					}
+					if (err.code === "ENOSPC") {
+						throw editError("disk_full", `Disk full: cannot write to ${path}`, "Free disk space and retry the edit.", { path });
+					}
+					throw editError("write_failed", `Failed to write ${path}: ${err.message}`, undefined, { path });
 				}
 				invalidateScanCache(absolutePath);
 

@@ -10,7 +10,9 @@
     "test": "node --test tests/**/*.test.ts",
     "bench": "npm run bench:native && npm run bench:tools",
     "bench:native": "node scripts/bench.ts",
-    "bench:tools": "node scripts/tool-bench.ts"
+    "bench:tools": "node scripts/tool-bench.ts",
+    "eval:tool-calls": "node scripts/eval-tool-calls.ts evals/tool-calls.jsonl evals/tool-calls.sample-results.jsonl",
+    "convert:tool-calls": "node scripts/convert-tool-call-runs.ts evals/tool-calls.raw-sample.json evals/tool-calls.converted-results.jsonl"
   },
   "pi": {
     "extensions": [

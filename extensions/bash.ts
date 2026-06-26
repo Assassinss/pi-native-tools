@@ -15,6 +15,11 @@ import { constants, createWriteStream } from "node:fs";
 import { access, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { toolError } from "./shared.ts";
+
+function bashError(code: string, message: string, hint?: string, details?: Record<string, unknown>): Error {
+	return toolError({ tool: "bash", code, message, hint, details, retryable: code !== "command_failed" });
+}
 
 type TextContent = { type: "text"; text: string };
 
@@ -32,10 +37,10 @@ type BashOptions = {
 const builtInBash = createBashToolDefinition(process.cwd());
 const bashSchema = Type.Object(
 	{
-		command: Type.String({ description: "The command to execute" }),
-		timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })),
-		session: Type.Optional(Type.Boolean({ description: "When false, bypass the persistent shell session for this command" })),
-		resetSession: Type.Optional(Type.Boolean({ description: "When true, discard any existing persistent shell session for this cwd before running" })),
+		command: Type.String({ description: "The shell command to execute. Best for build, test, run, git, or other shell-specific tasks." }),
+		timeout: Type.Optional(Type.Number({ minimum: 0, description: "Timeout in seconds for this command. Must be >= 0. Omit to use no explicit timeout." })),
+		session: Type.Optional(Type.Boolean({ description: "When false, run in a fresh one-shot shell instead of the persistent per-cwd session." })),
+		resetSession: Type.Optional(Type.Boolean({ description: "When true, discard the existing persistent shell session for this cwd before running the command." })),
 	},
 	{ additionalProperties: false },
 );
@@ -365,8 +370,10 @@ export async function executeBashNative(
 			const snapshot = accumulator.snapshot();
 			await accumulator.closeTempFile();
 			const { text } = formatOutput(snapshot, "");
-			if (controller.signal.aborted) throw new Error(appendStatus(text, "Command aborted"));
-			if (err instanceof Error) throw new Error(appendStatus(text, err.message));
+			if (controller.signal.aborted) {
+				throw bashError("aborted", appendStatus(text, "Command aborted"), "Retry the command if cancellation was unintended.", { cwd: resolvedCwd });
+			}
+			if (err instanceof Error) throw bashError("execution_failed", appendStatus(text, err.message), undefined, { cwd: resolvedCwd });
 			throw err;
 		}
 		if (shell && !result.cancelled && !result.timedOut) shellSessionsInitialized.add(sessionKey);
@@ -374,9 +381,25 @@ export async function executeBashNative(
 		const snapshot = accumulator.snapshot();
 		await accumulator.closeTempFile();
 		const { text, details } = formatOutput(snapshot);
-		if (result.cancelled || controller.signal.aborted) throw new Error(appendStatus(text, "Command aborted"));
-		if (result.timedOut) throw new Error(appendStatus(text, `Command timed out after ${timeout} seconds`));
-		if ((result.exitCode ?? 0) !== 0) throw new Error(appendStatus(text, `Command exited with code ${result.exitCode}`));
+		if (result.cancelled || controller.signal.aborted) {
+			throw bashError("aborted", appendStatus(text, "Command aborted"), "Retry the command if cancellation was unintended.", { cwd: resolvedCwd });
+		}
+		if (result.timedOut) {
+			throw bashError(
+				"timeout",
+				appendStatus(text, `Command timed out after ${timeout} seconds`),
+				"Increase timeout or make the command faster before retrying.",
+				{ cwd: resolvedCwd, timeout },
+			);
+		}
+		if ((result.exitCode ?? 0) !== 0) {
+			throw bashError(
+				"command_failed",
+				appendStatus(text, `Command exited with code ${result.exitCode}`),
+				"Inspect the command output and exit code, then fix the failing command or environment.",
+				{ cwd: resolvedCwd, exitCode: result.exitCode ?? 0 },
+			);
+		}
 		return { content: [{ type: "text", text }], details };
 	} finally {
 		signal?.removeEventListener("abort", relayAbort);
@@ -393,6 +416,16 @@ export async function executeBashNative(
 export function registerBashTool(pi: ExtensionAPI): void {
 	pi.registerTool({
 		...builtInBash,
+		description:
+			"Execute shell commands in the current working directory. Use this for build, test, run, git, and other shell-specific tasks. Do not use it for routine file reading or code search when read, find, or grep can answer more directly. Output is truncated and long output is saved to a temp file.",
+		promptSnippet: "Run shell commands only when the task is truly shell-specific",
+		promptGuidelines: [
+			"Use bash for build, test, run, git, environment inspection, or commands that require shell semantics.",
+			"Prefer read, find, and grep for routine code exploration instead of cat, ls, find, or grep in bash.",
+			"Session state persists by cwd unless session=false; use resetSession=true when prior shell state may interfere.",
+			"Example: 'run the unit tests' -> use bash with the test command.",
+			"Example: 'find where createServer is defined' -> use grep, not bash, because this is content search.",
+		],
 		parameters: bashSchema,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const { command, timeout, session, resetSession } = params as {
@@ -405,3 +438,4 @@ export function registerBashTool(pi: ExtensionAPI): void {
 		},
 	});
 }
+

@@ -1,0 +1,56 @@
+{
+  "runs": [
+    {
+      "caseId": "find-tests",
+      "tool_calls": [
+        {
+          "function": {
+            "name": "find",
+            "arguments": "{\"pattern\":\"**/*.test.ts\"}"
+          }
+        }
+      ],
+      "status": "ok"
+    },
+    {
+      "caseId": "grep-literal",
+      "toolCalls": [
+        {
+          "tool": "grep",
+          "args": {
+            "pattern": "fetchUser(",
+            "literal": true
+          }
+        }
+      ],
+      "finalOutcome": "ok"
+    },
+    {
+      "caseId": "edit-hashline-flow",
+      "calls": [
+        {
+          "name": "read",
+          "input": {
+            "path": "src/file.ts",
+            "withHashlines": true
+          }
+        },
+        {
+          "name": "edit",
+          "parameters": {
+            "path": "src/file.ts",
+            "edits": [
+              {
+                "hashline": "2:deadbeef",
+                "newText": "SECOND"
+              }
+            ]
+          }
+        }
+      ],
+      "metadata": {
+        "model": "demo"
+      }
+    }
+  ]
+}
