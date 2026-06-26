@@ -180,8 +180,8 @@ export function registerWriteTool(pi: ExtensionAPI): void {
 			"Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories. For files >5MB, uses streaming chunked writes to avoid OOM. After writing, verifies file integrity via file size and SHA256 hash.",
 		promptSnippet: "Create or overwrite files with streaming support",
 		promptGuidelines: [
-			"Use write for new files or complete rewrites.",
-			"For large files (5MB+), write streams content in 64KB chunks to prevent OOM.",
+			"Use write for new files or replacing the full contents of a file in one shot.",
+			"Use edit instead when changing only part of an existing file, and do not use bash redirection for simple file creation or overwrites.",
 		],
 		parameters: writeSchema,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {

@@ -211,10 +211,9 @@ export function registerReadTool(pi: ExtensionAPI): void {
 		description: `Read the contents of a file with hashline support. For text files, output is truncated to ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB. Use offset/limit for large files. Set withHashlines=true to get LINE:HASH|prefix for each line. Large files (>5MB) are streamed to avoid OOM.`,
 		promptSnippet: "Read file contents with hashline support",
 		promptGuidelines: [
-			"Use read to examine files instead of bash cat.",
-			"If the user provides file paths or @file references, read those files first.",
-			"Do not search for files the user already named.",
-			"Use withHashlines=true before editing to capture line hashes for safe hashline-anchored edits.",
+			"Use read when the user wants file contents or you need the exact current text.",
+			"If the user already named the file but wants search, counts, or a direct unique replacement, use grep or edit instead of reading first.",
+			"Use withHashlines=true before hashline-anchored edits to capture fresh LINE:HASH prefixes.",
 		],
 		parameters: readSchema,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {

@@ -111,10 +111,9 @@ export function registerFindTool(pi: ExtensionAPI): void {
 			"Find file and directory paths by glob pattern. Use this when you need candidate paths by name or location only. Prefer grep when searching file contents, read when opening a known file, and bash only for shell-specific tasks. Respects .gitignore and returns workspace-relative paths.",
 		promptSnippet: "Find file paths by glob before reading or searching file contents",
 		promptGuidelines: [
-			"Use find only when the user has not already provided the target paths.",
-			"Do not use find to rediscover files named explicitly or via @file references.",
-			"Prefer grep for searching inside files and read for opening a specific file.",
-			"Do not use bash ls/find for routine file discovery when this tool can answer directly.",
+			"Use find only to discover candidate file or directory paths by name or location.",
+			"If the user already gave the path, do not use find; read it, grep it, or edit it directly.",
+			"Use grep for content search and read for opening a specific file.",
 		],
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const { pattern, path: searchDir, limit } = params as { pattern: string; path?: string; limit?: number };

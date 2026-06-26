@@ -73,53 +73,6 @@ Run benchmarks:
 npm run bench
 ```
 
-Convert a raw JSON run log into eval JSONL:
-
-```bash
-npm run convert:tool-calls
-```
-
-Run the sample tool-calling eval:
-
-```bash
-npm run eval:tool-calls
-```
-
-The eval script compares an expected case file against a model/tool-call result file and reports:
-- strict pass / soft pass / fail
-- first-tool accuracy
-- argument-check accuracy
-- sequence accuracy for multi-step flows
-- bash overuse
-- a simple confusion matrix
-
-Files:
-- `evals/tool-calls.jsonl` - expected prompts, tools, forbidden tools, and arg checks; now includes more realistic confusion cases for read/find/grep/bash/write/edit
-- `evals/tool-calls.runs-template.json` - blank template for your own captured runs
-- `evals/tool-calls.raw-sample.json` - sample raw JSON log input for conversion
-- `evals/tool-calls.sample-results.jsonl` - already-normalized sample run output format
-- `scripts/convert-tool-call-runs.ts` - raw JSON to eval JSONL converter
-- `scripts/eval-tool-calls.ts` - scorer
-
-Expected normalized results file shape:
-
-```json
-{"id":"grep-literal","toolCalls":[{"tool":"grep","args":{"pattern":"fetchUser(","literal":true}}]}
-```
-
-Supported raw JSON shapes for conversion:
-- top-level array, or object with `runs` / `items` / `records` / `results`
-- tool call arrays under `toolCalls` / `tool_calls` / `calls` / `invocations`
-- tool names under `tool`, `name`, or `function.name`
-- arguments under `args`, `arguments`, `input`, `parameters`, or `function.arguments`
-
-Typical flow:
-
-```bash
-node scripts/convert-tool-call-runs.ts your-raw-runs.json evals/your-runs.jsonl
-node scripts/eval-tool-calls.ts evals/tool-calls.jsonl evals/your-runs.jsonl
-```
-
 ## Project layout
 
 - `index.ts` - package entry, registers all tool overrides
@@ -132,6 +85,7 @@ node scripts/eval-tool-calls.ts evals/tool-calls.jsonl evals/your-runs.jsonl
 - `extensions/write.ts` - write override
 - `tests/` - unit and integration coverage
 - `scripts/bench.ts` - local benchmark script
+- `scripts/run-tool-call-agent-eval.ts` - runs real Pi SDK sessions and captures tool calls
 
 ## Notes
 

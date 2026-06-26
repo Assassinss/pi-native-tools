@@ -238,11 +238,10 @@ export function registerGrepTool(pi: ExtensionAPI): void {
 			"Search file contents by regex or literal pattern. Use this when you need matching lines, counts, or files with matches. Prefer find for path discovery, read for full file inspection, and bash only for shell-specific tasks. Respects .gitignore and truncates long lines in output.",
 		promptSnippet: "Search file contents without falling back to bash grep",
 		promptGuidelines: [
-			"Use grep to search inside files for symbols, strings, or patterns across a path.",
-			"If the user provides file paths or @file references, read those files before using grep.",
-			"Only use grep after reading them when extra dependency or impact context is still needed.",
-			"Prefer literal=true when searching for exact text that may contain regex characters.",
-			"Prefer find for locating paths and read for viewing full file contents.",
+			"Use grep to search file contents for symbols, strings, definitions, counts, or files with matches.",
+			"If the user already named the file or directory to search, grep it directly; do not read first unless they asked to inspect content.",
+			"Use literal=true for exact code snippets, function calls, or text containing regex metacharacters like ()[]{}?.+*.",
+			"Use mode=count for totals and mode=filesWithMatches for file-name-only results.",
 		],
 		parameters: grepSchema,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {

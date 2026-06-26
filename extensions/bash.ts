@@ -421,10 +421,9 @@ export function registerBashTool(pi: ExtensionAPI): void {
 		promptSnippet: "Run shell commands only when the task is truly shell-specific",
 		promptGuidelines: [
 			"Use bash for build, test, run, git, environment inspection, or commands that require shell semantics.",
-			"Prefer read, find, and grep for routine code exploration instead of cat, ls, find, or grep in bash.",
+			"Do not use bash for routine file reads, path discovery, content search, or simple file writes when read, find, grep, write, or edit can answer directly.",
+			"Re-run a command only when the environment changed, the first run was incomplete, or the user asked to run it again.",
 			"Session state persists by cwd unless session=false; use resetSession=true when prior shell state may interfere.",
-			"Example: 'run the unit tests' -> use bash with the test command.",
-			"Example: 'find where createServer is defined' -> use grep, not bash, because this is content search.",
 		],
 		parameters: bashSchema,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {

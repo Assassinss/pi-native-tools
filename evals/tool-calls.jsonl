@@ -1,17 +1,12 @@
-{"id":"find-tests","prompt":"找所有 *.test.ts 文件","expectedTools":["find"],"forbiddenTools":["bash","grep","read"],"argChecks":[{"path":"pattern","equals":"**/*.test.ts"}],"tags":["selection","find"]}
-{"id":"grep-literal","prompt":"搜索 fetchUser(","expectedTools":["grep"],"forbiddenTools":["bash","find"],"argChecks":[{"path":"pattern","equals":"fetchUser("},{"path":"literal","equals":true}],"tags":["selection","grep","args"]}
-{"id":"read-package-json","prompt":"打开 package.json 看全部内容","expectedTools":["read"],"forbiddenTools":["bash","grep","find"],"argChecks":[{"path":"path","equals":"package.json"}],"tags":["selection","read"]}
-{"id":"edit-hashline-flow","prompt":"安全地把第 2 行改成 SECOND","expectedSequence":["read","edit"],"expectedTools":["read","edit"],"forbiddenTools":["bash"],"argChecks":[{"tool":"read","path":"withHashlines","equals":true},{"tool":"edit","path":"edits.0.hashline"},{"tool":"edit","path":"edits.0.newText","equals":"SECOND"}],"tags":["sequence","edit","hashline"]}
-{"id":"bash-test","prompt":"运行单元测试","expectedTools":["bash"],"argChecks":[{"path":"command","includes":"test"}],"tags":["selection","bash"]}
-{"id":"find-vs-grep","prompt":"哪个文件里定义了 createServer","expectedTools":["grep"],"forbiddenTools":["find","bash"],"argChecks":[{"path":"pattern","equals":"createServer"}],"tags":["selection","grep"]}
-{"id":"read-readme","prompt":"打开 README.md 看全部内容","expectedTools":["read"],"forbiddenTools":["bash","grep","find"],"argChecks":[{"path":"path","equals":"README.md"}],"tags":["selection","read"]}
-{"id":"grep-files-only","prompt":"哪些文件里包含 createServer，只要文件名","expectedTools":["grep"],"forbiddenTools":["bash","find"],"argChecks":[{"path":"pattern","equals":"createServer"},{"path":"mode","equals":"filesWithMatches"}],"tags":["selection","grep","mode"]}
-{"id":"grep-count","prompt":"统计 createServer 一共出现多少次","expectedTools":["grep"],"forbiddenTools":["bash","find","read"],"argChecks":[{"path":"pattern","equals":"createServer"},{"path":"mode","equals":"count"}],"tags":["selection","grep","mode"]}
-{"id":"find-markdown","prompt":"找出所有 Markdown 文件","expectedTools":["find"],"forbiddenTools":["bash","grep","read"],"argChecks":[{"path":"pattern","equals":"**/*.md"}],"tags":["selection","find"]}
-{"id":"find-src-tests","prompt":"列出 src 下面所有测试文件","expectedTools":["find"],"forbiddenTools":["bash","grep"],"argChecks":[{"path":"path","equals":"src"},{"path":"pattern","equals":"**/*.test.ts"}],"tags":["selection","find","path"]}
-{"id":"read-tsconfig","prompt":"打开 tsconfig.json","expectedTools":["read"],"forbiddenTools":["bash","grep","find"],"argChecks":[{"path":"path","equals":"tsconfig.json"}],"tags":["selection","read"]}
-{"id":"bash-git-status","prompt":"看看当前 git 状态","expectedTools":["bash"],"argChecks":[{"path":"command","includes":"git status"}],"tags":["selection","bash","git"]}
-{"id":"bash-run-lint","prompt":"跑一下 lint","expectedTools":["bash"],"forbiddenTools":["read","find","grep"],"argChecks":[{"path":"command","includes":"lint"}],"tags":["selection","bash"]}
-{"id":"write-new-file","prompt":"新建 notes/todo.txt，内容写 hello\nworld","expectedTools":["write"],"forbiddenTools":["bash","edit"],"argChecks":[{"path":"path","equals":"notes/todo.txt"},{"path":"content","equals":"hello\nworld"}],"tags":["selection","write"]}
-{"id":"edit-direct-replace","prompt":"把 src/flags.ts 里唯一的 return false; 改成 return true;","expectedTools":["edit"],"forbiddenTools":["bash","read"],"argChecks":[{"path":"path","equals":"src/flags.ts"},{"path":"edits.0.oldText","equals":"return false;"},{"path":"edits.0.newText","equals":"return true;"}],"tags":["selection","edit","args"]}
-{"id":"grep-literal-hook","prompt":"搜一下 useQuery(","expectedTools":["grep"],"forbiddenTools":["bash","find"],"argChecks":[{"path":"pattern","equals":"useQuery("},{"path":"literal","equals":true}],"tags":["selection","grep","args"]}
+{"id":"find-tests","prompt":"这个项目的测试主要都在哪些文件里？"}
+{"id":"read-readme","prompt":"README 开头大概讲了什么？先看前面一点就行。"}
+{"id":"grep-count","prompt":"tests 目录里提到 executeRead 的地方总共有几处？"}
+{"id":"bash-git-status","prompt":"帮我看看当前工作区现在干净不干净。"}
+{"id":"write-new-file","prompt":"先随手记个临时文件 notes.txt，里面放一句 hello。"}
+{"id":"edit-direct-replace","prompt":"把 package.json 调整成不是 private 包。"}
+{"id":"find-markdown","prompt":"仓库里有哪些 markdown 文档值得先看？"}
+{"id":"grep-guidelines","prompt":"工具使用提示那类文案主要写在哪？"}
+{"id":"grep-hashline","prompt":"hashline 相关逻辑都出现在哪些地方？"}
+{"id":"read-package-scripts","prompt":"我想看看 package.json 里 scripts 现在都有哪些。"}
+{"id":"find-bash-impl","prompt":"跟命令执行那块相关的实现文件在哪？"}
+{"id":"grep-session-reset","prompt":"重置 shell session 的逻辑是在哪处理的？"}

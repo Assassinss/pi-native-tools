@@ -393,13 +393,10 @@ export function registerEditTool(pi: ExtensionAPI): void {
 		promptSnippet:
 			"Make precise file edits with exact text replacement or hashline-anchored changes, including multiple disjoint edits in one call",
 		promptGuidelines: [
-			"Use edit for precise changes. Each edits[].oldText or edits[].hashline is matched against the original file, not after earlier edits are applied.",
-			"When changing multiple separate locations, use one edit call with multiple entries in edits[] instead of multiple edit calls.",
-			"For hashline-anchored safety: use read(withHashlines=true) first to capture line hashes, then use hashline+newText to verify line positions.",
-			"Keep edits[].oldText as small as possible while still being unique in the file.",
-			"Do not emit overlapping or nested edits.",
-			"Example: after read(withHashlines=true) returns '42:deadbeef|const x = 1;', use hashline='42:deadbeef' for a safe anchored edit.",
-			"Example: if replacing a known unique snippet like 'return false;', use oldText+newText instead of hashlines.",
+			"Use edit for precise changes to an existing file. Each edits[].oldText or edits[].hashline is matched against the original file, not after earlier edits are applied.",
+			"If the user gave a known unique snippet to replace, call edit directly with oldText+newText; do not read first just to prepare the edit.",
+			"Use read(withHashlines=true) first only for line-specific or safety-critical anchored edits, then pass hashline+newText.",
+			"When changing multiple separate locations, use one edit call with multiple entries in edits[].",
 		],
 		parameters: editSchema,
 		renderShell: builtInEdit.renderShell,
