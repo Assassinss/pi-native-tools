@@ -212,9 +212,9 @@ export function registerReadTool(pi: ExtensionAPI): void {
 		promptSnippet: "Read file contents with hashline support",
 		promptGuidelines: [
 			"Use read to examine files instead of bash cat.",
+			"If the user provides file paths or @file references, read those files first.",
+			"Do not search for files the user already named.",
 			"Use withHashlines=true before editing to capture line hashes for safe hashline-anchored edits.",
-			"Example: 'open src/app.ts' -> use read with the file path.",
-			"Example: 'change line 42 safely' -> use read withHashlines=true first, then pass the returned hashline to edit.",
 		],
 		parameters: readSchema,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {

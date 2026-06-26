@@ -239,10 +239,10 @@ export function registerGrepTool(pi: ExtensionAPI): void {
 		promptSnippet: "Search file contents without falling back to bash grep",
 		promptGuidelines: [
 			"Use grep to search inside files for symbols, strings, or patterns across a path.",
+			"If the user provides file paths or @file references, read those files before using grep.",
+			"Only use grep after reading them when extra dependency or impact context is still needed.",
 			"Prefer literal=true when searching for exact text that may contain regex characters.",
 			"Prefer find for locating paths and read for viewing full file contents.",
-			"Example: 'search for fetchUser(' -> use grep with literal=true because parentheses are regex characters.",
-			"Example: 'show me the whole package.json' -> use read, not grep, because the user wants full file contents.",
 		],
 		parameters: grepSchema,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
