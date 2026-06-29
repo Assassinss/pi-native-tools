@@ -60,6 +60,11 @@ const editSchema = Type.Object(
 			description:
 				"One or more targeted replacements. Each entry must be either oldText+newText or hashline+newText. Each edit is matched against the original file, not incrementally.",
 		}),
+		generateDiff: Type.Optional(
+			Type.Boolean({
+				description: "When false, skip generating the diff in details. Default: true.",
+			}),
+		),
 	},
 	{ additionalProperties: false },
 );
@@ -245,7 +250,8 @@ export function applyHashlineEdits(
 	filePath: string,
 ): string {
 	const { lines: baseLines, endsWithNewline } = splitContentLines(content);
-	const originalLines = endsWithNewline ? [...baseLines, ""] : [...baseLines];
+	// ponytail: avoid spread copy when endsWithNewline is false
+	const originalLines = endsWithNewline ? baseLines.concat("") : baseLines;
 	const verified: VerifiedHashlineEdit[] = [];
 	const targetedLines = new Set<number>();
 
@@ -406,6 +412,7 @@ export function registerEditTool(pi: ExtensionAPI): void {
 		async execute(_toolCallId, input, signal, _onUpdate, ctx) {
 			const cwd = ctx?.cwd ?? process.cwd();
 			const { path, textEdits, hashlineEdits } = validateEditInput(input as any);
+			const generateDiff = (input as any).generateDiff !== false;
 			const absolutePath = normalizePath(path, cwd);
 
 			return withFileMutationQueue(absolutePath, async () => {
@@ -445,16 +452,18 @@ export function registerEditTool(pi: ExtensionAPI): void {
 				}
 				invalidateScanCache(absolutePath);
 
-				const patch = generateStructuredPatch(basename(absolutePath), content, newContent);
-				const diffResult = generateDiffStringFromPatch(patch);
 				const editCount = textEdits.length + hashlineEdits.length;
+				const details: EditToolDetails = {};
+				if (generateDiff) {
+					const patch = generateStructuredPatch(basename(absolutePath), content, newContent);
+					const diffResult = generateDiffStringFromPatch(patch);
+					details.diff = diffResult.diff;
+					details.patch = formatStructuredPatch(patch);
+					details.firstChangedLine = diffResult.firstChangedLine;
+				}
 				return {
 					content: [{ type: "text", text: `Successfully applied ${editCount} edit(s) to ${path}.` }],
-					details: {
-						diff: diffResult.diff,
-						patch: formatStructuredPatch(patch),
-						firstChangedLine: diffResult.firstChangedLine,
-					} as EditToolDetails,
+					details,
 				};
 			});
 		},

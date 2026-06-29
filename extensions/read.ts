@@ -120,7 +120,7 @@ export async function executeReadStreaming(
 		function finalize() {
 			signal?.removeEventListener("abort", onAbort);
 			try {
-				const outputLines = endsWithNewline && lineIndex >= startLine && lines.length < maxTargetLines ? [...lines, ""] : lines;
+				const outputLines = endsWithNewline && lineIndex >= startLine && lines.length < maxTargetLines ? lines.concat("") : lines;
 				const outputText = withHashlines
 					? outputLines.map((line, i) => `${startLine + i + 1}:${shortHash(line)}|${line}`).join("\n")
 					: joinContentLines(outputLines, false);
@@ -169,7 +169,7 @@ export async function executeRead(
 	throwIfAborted(signal);
 
 	const { lines: fileLines, endsWithNewline } = splitContentLines(buffer.toString("utf-8"));
-	const allLines = endsWithNewline ? [...fileLines, ""] : fileLines;
+	const allLines = endsWithNewline ? fileLines.concat("") : fileLines;
 	const totalFileLines = allLines.length;
 	const startLine = offset ? Math.max(0, offset - 1) : 0;
 	if (startLine >= allLines.length) {

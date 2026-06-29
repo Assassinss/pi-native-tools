@@ -55,8 +55,18 @@ export function joinContentLines(lines: string[], endsWithNewline: boolean): str
 	return `${lines.join("\n")}${endsWithNewline ? "\n" : ""}`;
 }
 
+// ponytail: FNV-1a non-crypto hash, upgrade to SHA-256 if hash collision causes real issues
+function fnv1a(text: string): number {
+	let hash = 0x811c9dc5;
+	for (let i = 0; i < text.length; i++) {
+		hash ^= text.charCodeAt(i);
+		hash = Math.imul(hash, 0x01000193);
+	}
+	return hash >>> 0;
+}
+
 export function shortHash(content: string, len: number = HASH_SHORT_LEN): string {
-	return createHash("sha256").update(content, "utf-8").digest("hex").slice(0, len);
+	return fnv1a(content).toString(16).padStart(8, "0").slice(0, len);
 }
 
 export function fullHash(content: string | Buffer): string {
