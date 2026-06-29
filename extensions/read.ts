@@ -24,6 +24,11 @@ function readError(code: string, message: string, hint?: string, details?: Recor
 	return toolError({ tool: "read", code, message, hint, details, retryable: code !== "offset_out_of_range" });
 }
 
+function formatOffsetOutOfRangeMessage(offset: number, totalLines: number): string {
+	if (totalLines === 0) return `Line ${offset} is beyond end of file (0 lines total). The file is empty.`;
+	return `Line ${offset} is beyond end of file (${totalLines} lines total). Use offset=1 to read from the start, or offset=${totalLines} to read the last line.`;
+}
+
 const readSchema = Type.Object({
 	path: Type.String({ description: "Path to the file to read (relative or absolute)" }),
 	offset: Type.Optional(Type.Integer({ minimum: 1, description: "Line number to start reading from (1-indexed). Must be >= 1." })),
@@ -172,13 +177,11 @@ export async function executeRead(
 	const allLines = endsWithNewline ? fileLines.concat("") : fileLines;
 	const totalFileLines = allLines.length;
 	const startLine = offset ? Math.max(0, offset - 1) : 0;
-	if (startLine >= allLines.length) {
-		throw readError(
-			"offset_out_of_range",
-			`Offset ${offset} is beyond end of file (${allLines.length} lines total)`,
-			"Use a smaller offset or reread the file from the beginning.",
-			{ path, offset, totalLines: allLines.length },
-		);
+	if (offset !== undefined && startLine >= allLines.length) {
+		return {
+			content: [{ type: "text", text: formatOffsetOutOfRangeMessage(offset, allLines.length) }],
+			details: undefined,
+		};
 	}
 
 	const selectedLines = limit !== undefined ? allLines.slice(startLine, startLine + limit) : allLines.slice(startLine);

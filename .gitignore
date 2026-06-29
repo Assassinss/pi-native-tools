@@ -1,3 +1,4 @@
 node_modules
 .tmp*/
 notes.txt
+package-lock.json

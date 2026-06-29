@@ -50,6 +50,20 @@ function escapeRegex(pattern: string): string {
 	return pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function validateRegexPattern(pattern: string, ignoreCase: boolean | undefined): void {
+	try {
+		new RegExp(pattern, ignoreCase ? "i" : undefined);
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		throw grepError(
+			"invalid_regex",
+			`Invalid regex: ${message}`,
+			"Use literal=true for exact text or fix the regex syntax.",
+			{ pattern, literal: false },
+		);
+	}
+}
+
 function sanitizeLine(line: string): string {
 	return line.replace(/\r\n/g, "\n").replace(/\r/g, "").replace(/\n$/, "");
 }
@@ -184,6 +198,7 @@ export async function executeGrepNative(
 	const grepMode = mode ?? "content";
 	const contextValue = context && context > 0 ? context : 0;
 	const effectiveLimit = Math.max(1, limit ?? DEFAULT_LIMIT);
+	if (!literal) validateRegexPattern(pattern, ignoreCase);
 	const nativePattern = literal ? escapeRegex(pattern) : pattern;
 
 	let result;

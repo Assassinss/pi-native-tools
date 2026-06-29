@@ -6,6 +6,7 @@ import {
 	HASH_SHORT_LEN,
 	basename,
 	fsWriteFile,
+	fullHash,
 	joinContentLines,
 	normalizePath,
 	readFile,
@@ -388,6 +389,25 @@ function invalidateScanCache(absolutePath: string): void {
 	invalidateFsScanCache?.(dirname(absolutePath));
 }
 
+type NoopEditState = {
+	inputHash: string;
+	count: number;
+};
+
+const noopEditCounts = new Map<string, NoopEditState>();
+const NOOP_HARD_LIMIT = 3;
+
+function recordNoopEdit(path: string, inputHash: string): { count: number; escalate: boolean } {
+	const previous = noopEditCounts.get(path);
+	const count = previous?.inputHash === inputHash ? previous.count + 1 : 1;
+	noopEditCounts.set(path, { inputHash, count });
+	return { count, escalate: count >= NOOP_HARD_LIMIT };
+}
+
+function clearNoopEdit(path: string): void {
+	noopEditCounts.delete(path);
+}
+
 export function registerEditTool(pi: ExtensionAPI): void {
 	const builtInEdit = createEditToolDefinition(process.cwd());
 
@@ -411,9 +431,11 @@ export function registerEditTool(pi: ExtensionAPI): void {
 		prepareArguments: prepareEditArguments,
 		async execute(_toolCallId, input, signal, _onUpdate, ctx) {
 			const cwd = ctx?.cwd ?? process.cwd();
-			const { path, textEdits, hashlineEdits } = validateEditInput(input as any);
-			const generateDiff = (input as any).generateDiff !== false;
+			const preparedInput = prepareEditArguments(input);
+			const { path, textEdits, hashlineEdits } = validateEditInput(preparedInput as any);
+			const generateDiff = (preparedInput as any).generateDiff !== false;
 			const absolutePath = normalizePath(path, cwd);
+			const inputHash = fullHash(JSON.stringify(preparedInput));
 
 			return withFileMutationQueue(absolutePath, async () => {
 				throwIfAborted(signal);
@@ -438,6 +460,20 @@ export function registerEditTool(pi: ExtensionAPI): void {
 				if (hashlineEdits.length > 0) newContent = applyHashlineEdits(newContent, hashlineEdits, path);
 				throwIfAborted(signal);
 
+				if (newContent === content) {
+					const noop = recordNoopEdit(absolutePath, inputHash);
+					throw editError(
+						noop.escalate ? "noop_edit_loop" : "noop_edit",
+						noop.escalate
+							? `Edit failed: identical no-op edit repeated ${noop.count} times for ${path}. Re-read the file and issue a different edit.`
+							: `Edit made no changes to ${path}. Re-read the file and issue a different edit.`,
+						noop.escalate
+							? "This exact edit payload keeps producing no changes. Read the file again before retrying."
+							: "Read the file again and change the edit payload before retrying.",
+						{ path, repeatCount: noop.count },
+					);
+				}
+
 				try {
 					await fsWriteFile(absolutePath, newContent, "utf-8");
 				} catch (err: any) {
@@ -450,6 +486,7 @@ export function registerEditTool(pi: ExtensionAPI): void {
 					}
 					throw editError("write_failed", `Failed to write ${path}: ${err.message}`, undefined, { path });
 				}
+				clearNoopEdit(absolutePath);
 				invalidateScanCache(absolutePath);
 
 				const editCount = textEdits.length + hashlineEdits.length;

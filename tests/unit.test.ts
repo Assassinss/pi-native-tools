@@ -163,6 +163,42 @@ test("generateDiffString collapses large unchanged regions instead of showing un
 	assert.match(diff.diff, /changed-before-end/);
 });
 
+test("edit rejects repeated identical no-op edits", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-noop-"));
+	try {
+		const file = join(dir, "noop.txt");
+		await writeFile(file, "alpha\n", "utf-8");
+		for (let attempt = 1; attempt <= 3; attempt++) {
+			await assert.rejects(
+				(async () => {
+					const { registerEditTool } = await import("../extensions/edit.ts");
+					let editDef: any;
+					registerEditTool({
+						registerTool(def: any) {
+							editDef = def;
+						},
+					} as any);
+					return editDef.execute(
+						"1",
+						{ path: file, edits: [{ oldText: "alpha", newText: "alpha" }] },
+						undefined,
+						undefined,
+						{ cwd: dir },
+					);
+				})(),
+				(error: unknown) => {
+					assert.ok(error instanceof Error);
+					assert.match(error.message, /^TOOL_ERROR /);
+					assert.match(error.message, attempt >= 3 ? /"code":"noop_edit_loop"/ : /"code":"noop_edit"/);
+					return true;
+				},
+			);
+		}
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
 test("prepareEditArguments supports legacy flat format and JSON string edits", () => {
 	const legacy = prepareEditArguments({ path: "a.txt", oldText: "a", newText: "b" });
 	assert.deepEqual(legacy, { path: "a.txt", edits: [{ oldText: "a", newText: "b" }] });
@@ -235,21 +271,16 @@ test("executeRead includes a stable trailing empty line in hashline mode", async
 	}
 });
 
-test("executeRead returns structured offset_out_of_range errors", async () => {
+test("executeRead returns recoverable guidance for offset out of range", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-tools-read-oob-"));
 	try {
 		const file = join(dir, "sample.txt");
 		await writeFile(file, "one\ntwo\n", "utf-8");
-		await assert.rejects(
-			executeRead(file, 99, undefined, false, undefined, dir),
-			(error: unknown) => {
-				assert.ok(error instanceof Error);
-				assert.match(error.message, /^TOOL_ERROR /);
-				assert.match(error.message, /"code":"offset_out_of_range"/);
-				assert.match(error.message, /Offset 99 is beyond end of file/);
-				return true;
-			},
-		);
+		const result = await executeRead(file, 99, undefined, false, undefined, dir);
+		const text = result.content[0]?.text ?? "";
+		assert.match(text, /Line 99 is beyond end of file \(3 lines total\)/);
+		assert.match(text, /Use offset=1 to read from the start/);
+		assert.equal(result.details, undefined);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
@@ -264,6 +295,24 @@ test("executeWrite writes and verifies small file", async () => {
 		assert.equal(written, "hello small write");
 		assert.equal(result.details?.size, Buffer.byteLength("hello small write", "utf-8"));
 		assert.match(result.content[0]?.text ?? "", /Successfully wrote/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeWrite strips hashline display prefixes before writing", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-write-hashline-strip-"));
+	try {
+		const file = join(dir, "stripped.txt");
+		const result = await executeWrite(
+			file,
+			"[stripped.txt#deadbeef]\n1:11111111|alpha\n2:22222222|beta",
+			undefined,
+			dir,
+		);
+		const written = await readFile(file, "utf-8");
+		assert.equal(written, "alpha\nbeta");
+		assert.match(result.content[0]?.text ?? "", /auto-stripped hashline display prefixes/);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
@@ -452,6 +501,7 @@ test("executeGrepNative escapes literals", async () => {
 test("executeGrepNative returns structured invalid regex errors", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-tools-grep-invalid-regex-"));
 	try {
+		await writeFile(join(dir, "sample.txt"), "needle\n", "utf-8");
 		await assert.rejects(
 			executeGrepNative("[", undefined, undefined, false, false, 0, 10, dir, undefined, undefined),
 			(error: unknown) => {

@@ -28,6 +28,37 @@ const writeSchema = Type.Object({
 	content: Type.String({ description: "Content to write to the file" }),
 });
 
+const HASHLINE_LINE_RE = /^\d+:[a-f0-9]{8}\|/i;
+const HASHLINE_HEADER_RE = /^\[[^\]\r\n]+#[a-f0-9]{8,}\]$/i;
+
+function stripHashlineDisplayPrefixes(content: string): { text: string; stripped: boolean } {
+	const lines = content.split("\n");
+	if (lines.length === 0) return { text: content, stripped: false };
+
+	let stripped = false;
+	let firstNonEmpty = lines.findIndex((line) => line.trim().length > 0);
+	if (firstNonEmpty !== -1 && HASHLINE_HEADER_RE.test(lines[firstNonEmpty]!)) {
+		lines.splice(firstNonEmpty, 1);
+		stripped = true;
+		if (firstNonEmpty < lines.length && lines[firstNonEmpty] === "") {
+			lines.splice(firstNonEmpty, 1);
+		}
+		firstNonEmpty = lines.findIndex((line) => line.trim().length > 0);
+	}
+
+	if (firstNonEmpty === -1 || !HASHLINE_LINE_RE.test(lines[firstNonEmpty]!)) {
+		return { text: stripped ? lines.join("\n") : content, stripped };
+	}
+
+	for (let i = 0; i < lines.length; i++) {
+		if (!HASHLINE_LINE_RE.test(lines[i]!)) continue;
+		lines[i] = lines[i]!.replace(HASHLINE_LINE_RE, "");
+		stripped = true;
+	}
+
+	return { text: lines.join("\n"), stripped };
+}
+
 function getSafeChunkEnd(content: string, start: number, maxCodeUnits: number): number {
 	let end = Math.min(start + maxCodeUnits, content.length);
 	if (end < content.length) {
@@ -53,6 +84,7 @@ export async function executeWrite(
 ): Promise<{ content: TextContent[]; details: { size: number; hash: string } | undefined }> {
 	const absolutePath = normalizePath(path, cwd);
 	const dir = dirname(absolutePath);
+	const { text: cleanContent, stripped } = stripHashlineDisplayPrefixes(content);
 
 	try {
 		await mkdir(dir, { recursive: true });
@@ -64,12 +96,12 @@ export async function executeWrite(
 	}
 
 	throwIfAborted(signal);
-	const contentSize = Buffer.byteLength(content, "utf-8");
+	const contentSize = Buffer.byteLength(cleanContent, "utf-8");
 
 	if (contentSize < STREAMING_THRESHOLD) {
 		return withFileMutationQueue(absolutePath, async () => {
 			throwIfAborted(signal);
-			const contentBuffer = Buffer.from(content, "utf-8");
+			const contentBuffer = Buffer.from(cleanContent, "utf-8");
 			try {
 				await fsWriteFile(absolutePath, contentBuffer);
 			} catch (err: any) {
@@ -85,13 +117,10 @@ export async function executeWrite(
 			const writtenStat = await stat(absolutePath);
 			const writtenHash = fullHash(contentBuffer);
 			invalidateScanCache(absolutePath, dir);
+			let resultText = `Successfully wrote ${formatSize(contentSize)} to ${path} (verified: ${writtenStat.size} bytes, SHA256: ${writtenHash.slice(0, 16)}...).`;
+			if (stripped) resultText += "\nNote: auto-stripped hashline display prefixes from content before writing.";
 			return {
-				content: [
-					{
-						type: "text",
-						text: `Successfully wrote ${formatSize(contentSize)} to ${path} (verified: ${writtenStat.size} bytes, SHA256: ${writtenHash.slice(0, 16)}...).`,
-					},
-				],
+				content: [{ type: "text", text: resultText }],
 				details: { size: writtenStat.size, hash: writtenHash },
 			};
 		});
@@ -140,7 +169,9 @@ export async function executeWrite(
 						content: [
 							{
 								type: "text",
-								text: `Successfully wrote ${formatSize(contentSize)} to ${path} via streaming (verified: ${writtenStat.size} bytes, SHA256: ${fileHash.slice(0, 16)}...).`,
+								text:
+								`Successfully wrote ${formatSize(contentSize)} to ${path} via streaming (verified: ${writtenStat.size} bytes, SHA256: ${fileHash.slice(0, 16)}...).` +
+								(stripped ? "\nNote: auto-stripped hashline display prefixes from content before writing." : ""),
 							},
 						],
 						details: { size: writtenStat.size, hash: fileHash },
@@ -153,9 +184,9 @@ export async function executeWrite(
 			let offset = 0;
 
 			const writeNextChunk = () => {
-				while (offset < content.length) {
-					const end = getSafeChunkEnd(content, offset, WRITE_CHUNK_SIZE);
-					const chunk = content.slice(offset, end);
+				while (offset < cleanContent.length) {
+					const end = getSafeChunkEnd(cleanContent, offset, WRITE_CHUNK_SIZE);
+					const chunk = cleanContent.slice(offset, end);
 					const chunkBuffer = Buffer.from(chunk, "utf-8");
 					hash.update(chunkBuffer);
 					offset = end;
