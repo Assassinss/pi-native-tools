@@ -20,6 +20,7 @@ import {
 function writeError(code: string, message: string, hint?: string, details?: Record<string, unknown>): Error {
 	return toolError({ tool: "write", code, message, hint, details });
 }
+import { chmod } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { invalidateFsScanCache } from "./omp-native.ts";
 
@@ -76,6 +77,36 @@ function invalidateScanCache(absolutePath: string, dir: string): void {
 	invalidateFsScanCache?.(dir);
 }
 
+function shouldMarkExecutable(path: string, content: string): boolean {
+	return /\.(sh|bash|zsh|py|pl|rb|js|ts)$/i.test(path) && content.startsWith("#!");
+}
+
+async function maybeMarkExecutable(absolutePath: string, path: string, content: string): Promise<boolean> {
+	if (!shouldMarkExecutable(path, content) || process.platform === "win32") return false;
+	try {
+		await chmod(absolutePath, 0o755);
+		return true;
+	} catch (err: any) {
+		if (err?.code === "ENOSYS" || err?.code === "EPERM" || err?.code === "EACCES") return false;
+		throw writeError("chmod_failed", `Wrote ${path} but failed to mark it executable: ${err.message}`, "Adjust file permissions manually if needed.", { path });
+	}
+}
+
+function buildWriteSuccessMessage(
+	path: string,
+	contentSize: number,
+	verifiedSize: number,
+	hash: string,
+	streaming: boolean,
+	stripped: boolean,
+	markedExecutable: boolean,
+): string {
+	let text = `Successfully wrote ${formatSize(contentSize)} to ${path}${streaming ? " via streaming" : ""} (verified: ${verifiedSize} bytes, SHA256: ${hash.slice(0, 16)}...).`;
+	if (stripped) text += "\nNote: auto-stripped hashline display prefixes from content before writing.";
+	if (markedExecutable) text += "\nNote: marked shebang file as executable.";
+	return text;
+}
+
 export async function executeWrite(
 	path: string,
 	content: string,
@@ -116,11 +147,10 @@ export async function executeWrite(
 			throwIfAborted(signal);
 			const writtenStat = await stat(absolutePath);
 			const writtenHash = fullHash(contentBuffer);
+			const markedExecutable = await maybeMarkExecutable(absolutePath, path, cleanContent);
 			invalidateScanCache(absolutePath, dir);
-			let resultText = `Successfully wrote ${formatSize(contentSize)} to ${path} (verified: ${writtenStat.size} bytes, SHA256: ${writtenHash.slice(0, 16)}...).`;
-			if (stripped) resultText += "\nNote: auto-stripped hashline display prefixes from content before writing.";
 			return {
-				content: [{ type: "text", text: resultText }],
+				content: [{ type: "text", text: buildWriteSuccessMessage(path, contentSize, writtenStat.size, writtenHash, false, stripped, markedExecutable) }],
 				details: { size: writtenStat.size, hash: writtenHash },
 			};
 		});
@@ -164,14 +194,13 @@ export async function executeWrite(
 						);
 						return;
 					}
+					const markedExecutable = await maybeMarkExecutable(absolutePath, path, cleanContent);
 					invalidateScanCache(absolutePath, dir);
 					resolve({
 						content: [
 							{
 								type: "text",
-								text:
-								`Successfully wrote ${formatSize(contentSize)} to ${path} via streaming (verified: ${writtenStat.size} bytes, SHA256: ${fileHash.slice(0, 16)}...).` +
-								(stripped ? "\nNote: auto-stripped hashline display prefixes from content before writing." : ""),
+								text: buildWriteSuccessMessage(path, contentSize, writtenStat.size, fileHash, true, stripped, markedExecutable),
 							},
 						],
 						details: { size: writtenStat.size, hash: fileHash },

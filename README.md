@@ -1,94 +1,108 @@
 # pi-native-tools
 
-Pi package that overrides the built-in `bash`, `find`, `grep`, `read`, `edit`, and `write` tools.
+Pi package that replaces the built-in `bash`, `find`, `grep`, `read`, `edit`, and `write` tools.
 
-The goal is simple:
-- keep `read` / `edit` / `write` compatible with the existing hashline workflow
-- replace `bash`, `find`, and `grep` with native-backed implementations
-- keep the package installable through `pi install` without asking users to install extra native packages by hand
-
-## Included tools
-
-- `bash` - persistent native shell sessions with one-shot fallback when a session is busy
-- `find` - native glob-based file search
-- `grep` - native in-process content search
-- `read` - file reads with offset/limit and optional hashlines
-- `edit` - exact-match and hashline-anchored edits
-- `write` - verified writes with streaming for large files
-
-All tools are registered under Pi's built-in names, so installing this package replaces the default implementations.
-
-## Why `bash`, `find`, and `grep`
-
-- `bash` - keeps a warm native shell per cwd, so repeated commands avoid process startup and can reuse shell state; falls back to one-shot execution when a session is already busy
-- `find` - walks globs in-process, respects `.gitignore`, avoids external `fd` / `rg` startup, and returns normalized relative paths
-- `grep` - searches file content in-process, respects `.gitignore`, supports regex/literal/context/limits, and returns Pi-friendly truncated output without spawning `rg`
-
+It keeps the same tool names, but swaps in:
+- native-backed `bash`, `find`, and `grep`
+- safer `read`, `edit`, and `write` behavior for hashline-based file workflows
 
 ## Install
-
-Git repo:
 
 ```bash
 pi install git:github.com/Assassinss/pi-native-tools
 ```
 
-SSH install form:
+SSH form:
 
 ```bash
 pi install git:git@github.com:Assassinss/pi-native-tools.git
 ```
 
-## Native runtime
+## Highlights
 
-This package loads platform-specific native addons through `optionalDependencies`:
+- `bash` - warm native shell sessions for faster repeated commands
+- `find` - native glob search with normalized relative paths
+- `grep` - native in-process search with regex, literal, context, count, and files-with-matches modes
+- `read` - `offset` / `limit`, explicit `ranges`, optional context windows, hashline output, binary/NUL rejection, and large-file streaming
+- `edit` - exact-text and hashline-anchored edits, original-snapshot matching, no-op loop protection, and post-write verification
+- `write` - parent directory creation, verified writes, large-file streaming, hashline stripping, and shebang executable support on Unix-like systems
 
-- `@oh-my-pi/pi-natives-win32-x64`
-- `@oh-my-pi/pi-natives-linux-x64`
-- `@oh-my-pi/pi-natives-linux-arm64`
-- `@oh-my-pi/pi-natives-darwin-x64`
-- `@oh-my-pi/pi-natives-darwin-arm64`
+## Examples
 
-Users should not need to install those manually. `pi install` / `npm install` should pull the matching platform package automatically.
+Read a normal slice:
 
-If the native addon is missing anyway, `extensions/omp-native.ts` throws a clear reinstall message instead of failing silently.
-
-## Development
-
-Install deps:
-
-```bash
-npm install
+```json
+{
+  "path": "src/app.ts",
+  "offset": 20,
+  "limit": 40
+}
 ```
 
-Run tests:
+Read multiple ranges with context:
 
-```bash
-npm test
+```json
+{
+  "path": "src/app.ts",
+  "ranges": [
+    { "start": 20, "end": 40 },
+    { "start": 120, "end": 125, "before": 2, "after": 2 }
+  ]
+}
 ```
 
-Run benchmarks:
+Read with hashlines before an anchored edit:
 
-```bash
-npm run bench
+```json
+{
+  "path": "src/app.ts",
+  "ranges": [
+    { "start": 80, "end": 90 }
+  ],
+  "withHashlines": true
+}
 ```
 
-## Project layout
+Apply a hashline-based edit:
 
-- `index.ts` - package entry, registers all tool overrides
-- `extensions/bash.ts` - native bash override
-- `extensions/find.ts` - native find override
-- `extensions/grep.ts` - native grep override
-- `extensions/omp-native.ts` - platform native loader shim
-- `extensions/read.ts` - read override
-- `extensions/edit.ts` - edit override
-- `extensions/write.ts` - write override
-- `tests/` - unit and integration coverage
-- `scripts/bench.ts` - local benchmark script
-- `scripts/run-tool-call-agent-eval.ts` - runs real Pi SDK sessions and captures tool calls
+```json
+{
+  "path": "src/app.ts",
+  "edits": [
+    {
+      "hashline": "84:a1b2c3d4",
+      "newText": "const enabled = true;"
+    }
+  ]
+}
+```
+
+Write copied hashline content safely:
+
+```json
+{
+  "path": "notes.txt",
+  "content": "[notes.txt#deadbeef]\n1:11111111|hello\n2:22222222|world"
+}
+```
+
+Written file content:
+
+```text
+hello
+world
+```
 
 ## Notes
 
-- `bash` is optimized for repeated commands in the same cwd; true one-shot commands may still be slower than Pi's old shell path
-- `find` and `grep` are meant to avoid external `fd` / `rg` process startup
-- `read`, `edit`, and `write` stay focused on safe file operations, not editor-like features
+- `read` `ranges` cannot be combined with `offset` / `limit`
+- `read` returns recovery guidance for out-of-range offsets
+- `bash` is optimized for repeated commands in the same cwd; true one-shot commands may still be slower than the old shell path
+
+## Dev
+
+```bash
+npm install
+npm test
+npm run bench
+```

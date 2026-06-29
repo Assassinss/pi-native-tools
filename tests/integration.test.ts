@@ -165,6 +165,40 @@ test("registered tools apply multiple hashline edits from one read snapshot", as
 	}
 });
 
+test("registered read supports explicit ranges with context", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-read-ranges-integration-"));
+	try {
+		const pi = createPiStub();
+		extension(pi as any);
+		const read = pi.tools.get("read");
+		const write = pi.tools.get("write");
+		assert.ok(read);
+		assert.ok(write);
+
+		const file = join(dir, "ranges.txt");
+		await write!.execute(
+			"1",
+			{ path: file, content: Array.from({ length: 10 }, (_, i) => `line-${i + 1}`).join("\n") },
+			undefined,
+			undefined,
+			{ cwd: dir },
+		);
+		const result = await read!.execute(
+			"2",
+			{ path: file, ranges: [{ start: 4, end: 5, before: 1, after: 1 }] },
+			undefined,
+			undefined,
+			{ cwd: dir },
+		);
+		const text = extractText(result);
+		assert.match(text, /\[lines 3-6 \| requested lines 4-5 \| context -1\/\+1\]/);
+		assert.match(text, /3\|line-3/);
+		assert.match(text, /6\|line-6/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
 test("registered native find and grep work end-to-end", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-tools-native-search-"));
 	try {

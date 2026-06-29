@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -12,6 +12,7 @@ import {
 	prepareEditArguments,
 	validateEditInput,
 	verifyHashline,
+	registerEditTool,
 } from "../extensions/edit.ts";
 import { executeRead } from "../extensions/read.ts";
 import { executeWrite } from "../extensions/write.ts";
@@ -168,24 +169,21 @@ test("edit rejects repeated identical no-op edits", async () => {
 	try {
 		const file = join(dir, "noop.txt");
 		await writeFile(file, "alpha\n", "utf-8");
+		let editDef: any;
+		registerEditTool({
+			registerTool(def: any) {
+				editDef = def;
+			},
+		} as any);
 		for (let attempt = 1; attempt <= 3; attempt++) {
 			await assert.rejects(
-				(async () => {
-					const { registerEditTool } = await import("../extensions/edit.ts");
-					let editDef: any;
-					registerEditTool({
-						registerTool(def: any) {
-							editDef = def;
-						},
-					} as any);
-					return editDef.execute(
-						"1",
-						{ path: file, edits: [{ oldText: "alpha", newText: "alpha" }] },
-						undefined,
-						undefined,
-						{ cwd: dir },
-					);
-				})(),
+				editDef.execute(
+					"1",
+					{ path: file, edits: [{ oldText: "alpha", newText: "alpha" }] },
+					undefined,
+					undefined,
+					{ cwd: dir },
+				),
 				(error: unknown) => {
 					assert.ok(error instanceof Error);
 					assert.match(error.message, /^TOOL_ERROR /);
@@ -194,6 +192,30 @@ test("edit rejects repeated identical no-op edits", async () => {
 				},
 			);
 		}
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("edit verifies on-disk bytes after write", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-verify-"));
+	try {
+		const file = join(dir, "verify.txt");
+		await writeFile(file, "alpha beta\n", "utf-8");
+		let editDef: any;
+		registerEditTool({
+			registerTool(def: any) {
+				editDef = def;
+			},
+		} as any);
+		await editDef.execute(
+			"1",
+			{ path: file, edits: [{ oldText: "beta", newText: "delta" }] },
+			undefined,
+			undefined,
+			{ cwd: dir },
+		);
+		assert.equal(await readFile(file, "utf-8"), "alpha delta\n");
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
@@ -251,6 +273,79 @@ test("executeRead reads offset/limit and hashlines", async () => {
 		assert.match(text, /^2:[a-f0-9]{8}\|two/m);
 		assert.match(text, /^3:[a-f0-9]{8}\|three/m);
 		assert.match(text, /more lines in file|truncated|Showing lines/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeRead supports explicit ranges with context", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-read-ranges-"));
+	try {
+		const file = join(dir, "sample.txt");
+		await writeFile(file, Array.from({ length: 12 }, (_, i) => `line-${i + 1}`).join("\n"), "utf-8");
+		const result = await executeRead(
+			file,
+			undefined,
+			undefined,
+			false,
+			undefined,
+			dir,
+			[
+				{ start: 3, end: 4, before: 1, after: 1 },
+				{ start: 9, end: 10, before: 1, after: 0 },
+			],
+		);
+		const text = result.content[0]?.text ?? "";
+		assert.match(text, /\[lines 2-5 \| requested lines 3-4 \| context -1\/\+1\]/);
+		assert.match(text, /2\|line-2/);
+		assert.match(text, /5\|line-5/);
+		assert.match(text, /\[lines 8-10 \| requested lines 9-10 \| context -1\/\+0\]/);
+		assert.match(text, /8\|line-8/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeRead merges overlapping ranges", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-read-ranges-merge-"));
+	try {
+		const file = join(dir, "sample.txt");
+		await writeFile(file, Array.from({ length: 8 }, (_, i) => `line-${i + 1}`).join("\n"), "utf-8");
+		const result = await executeRead(
+			file,
+			undefined,
+			undefined,
+			false,
+			undefined,
+			dir,
+			[
+				{ start: 3, end: 4, after: 1 },
+				{ start: 5, end: 5 },
+			],
+		);
+		const text = result.content[0]?.text ?? "";
+		assert.match(text, /merged requests: lines 3-4, line 5/);
+		assert.match(text, /3\|line-3/);
+		assert.match(text, /5\|line-5/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeRead rejects binary files with NUL bytes", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-read-binary-"));
+	try {
+		const file = join(dir, "sample.bin");
+		await writeFile(file, Buffer.from([0x41, 0x00, 0x42]));
+		await assert.rejects(
+			executeRead(file, undefined, undefined, false, undefined, dir),
+			(error: unknown) => {
+				assert.ok(error instanceof Error);
+				assert.match(error.message, /^TOOL_ERROR /);
+				assert.match(error.message, /"code":"binary_file"/);
+				return true;
+			},
+		);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
@@ -318,6 +413,20 @@ test("executeWrite strips hashline display prefixes before writing", async () =>
 	}
 });
 
+test("executeWrite marks shebang script executable on unix", async () => {
+	if (process.platform === "win32") return;
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-write-shebang-"));
+	try {
+		const file = join(dir, "tool.sh");
+		const result = await executeWrite(file, "#!/bin/sh\necho hi\n", undefined, dir);
+		const stats = await statMode(file);
+		assert.equal((stats & 0o111) !== 0, true);
+		assert.match(result.content[0]?.text ?? "", /marked shebang file as executable/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
 test("executeWrite writes and verifies large streaming file", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-tools-write-large-"));
 	try {
@@ -362,6 +471,34 @@ test("executeRead streams large file", async () => {
 		const text = result.content[0]?.text ?? "";
 		assert.match(text, /^line/m);
 		assert.match(text, /Streaming read/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeRead streams disjoint ranges from large files", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-stream-read-ranges-"));
+	try {
+		const file = join(dir, "large-read-ranges.txt");
+		const content = Array.from({ length: 600000 }, (_, i) => `line-${i + 1}`).join("\n") + "\n";
+		assert.ok(Buffer.byteLength(content, "utf-8") > 5 * 1024 * 1024);
+		await writeFile(file, content, "utf-8");
+		const result = await executeRead(
+			file,
+			undefined,
+			undefined,
+			false,
+			undefined,
+			dir,
+			[
+				{ start: 100, end: 101, before: 1, after: 1 },
+				{ start: 500000, end: 500001 },
+			],
+		);
+		const text = result.content[0]?.text ?? "";
+		assert.match(text, /99\|line-99/);
+		assert.match(text, /100\|line-100/);
+		assert.match(text, /500000\|line-500000/);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
@@ -655,3 +792,8 @@ test("executeBashNative evicts idle shell sessions", async () => {
 		await rm(dir, { recursive: true, force: true });
 	}
 });
+
+async function statMode(path: string): Promise<number> {
+	const { stat } = await import("node:fs/promises");
+	return (await stat(path)).mode;
+}
