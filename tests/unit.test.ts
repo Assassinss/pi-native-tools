@@ -6,8 +6,9 @@ import { join } from "node:path";
 import {
 	applyHashlineEdits,
 	applyTextEdits,
-	generateDiffString,
-	generatePatch,
+	generateStructuredPatch,
+	formatStructuredPatch,
+	generateDiffStringFromPatch,
 	parseHashline,
 	prepareEditArguments,
 	validateEditInput,
@@ -141,24 +142,26 @@ test("applyHashlineEdits supports multi-line replacement and insertion", () => {
 	assert.equal(inserted, "a\nb\ni1\ni2\nc");
 });
 
-test("generateDiffString and generatePatch report changed line", () => {
+test("generateDiffStringFromPatch and generateStructuredPatch report changed line", () => {
 	const oldContent = "line1\nline2\nline3";
 	const newContent = "line1\nline2\nchanged";
-	const diff = generateDiffString(oldContent, newContent);
+	const patch = generateStructuredPatch("file.txt", oldContent, newContent);
+	const diff = generateDiffStringFromPatch(patch);
 	assert.equal(diff.firstChangedLine, 3);
 	assert.match(diff.diff, /-3 line3/);
 	assert.match(diff.diff, /\+3 changed/);
-	const patch = generatePatch("file.txt", oldContent, newContent);
-	assert.match(patch, /--- file.txt/);
-	assert.match(patch, /\+\+\+ file.txt/);
+	const formatted = formatStructuredPatch(patch);
+	assert.match(formatted, /--- file.txt/);
+	assert.match(formatted, /\+\+\+ file.txt/);
 });
 
-test("generateDiffString collapses large unchanged regions instead of showing untouched code", () => {
+test("generateDiffStringFromPatch collapses large unchanged regions instead of showing untouched code", () => {
 	const oldLines = ["start", ...Array.from({ length: 20 }, (_, i) => `keep-${i + 1}`), "before-end", "tail"];
 	const newLines = [...oldLines];
 	newLines[newLines.length - 2] = "changed-before-end";
 
-	const diff = generateDiffString(oldLines.join("\n"), newLines.join("\n"));
+	const patch = generateStructuredPatch("file", oldLines.join("\n"), newLines.join("\n"));
+	const diff = generateDiffStringFromPatch(patch);
 	assert.match(diff.diff, /\.\.\./);
 	assert.doesNotMatch(diff.diff, /keep-1\n keep-2\n keep-3\n keep-4\n keep-5\n keep-6/);
 	assert.match(diff.diff, /changed-before-end/);

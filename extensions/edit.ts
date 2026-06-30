@@ -82,27 +82,6 @@ export function verifyHashline(lineContent: string, expectedHash: string): boole
 
 const EDIT_CONTEXT_LINES = 4; // ponytail: 4 context lines, tune if diffs need more/less context
 
-export function generateDiffString(
-	oldContent: string,
-	newContent: string,
-	contextLines = EDIT_CONTEXT_LINES,
-): { diff: string; firstChangedLine?: number } {
-	const patch = generateStructuredPatch("file", oldContent, newContent, contextLines);
-	return generateDiffStringFromPatch(patch);
-}
-
-export function generatePatch(
-	filePath: string,
-	oldContent: string,
-	newContent: string,
-	contextLines = EDIT_CONTEXT_LINES,
-): string {
-	return Diff.createTwoFilesPatch(filePath, filePath, oldContent, newContent, undefined, undefined, {
-		context: contextLines,
-		headerOptions: Diff.FILE_HEADERS_ONLY,
-	});
-}
-
 export function generateStructuredPatch(
 	filePath: string,
 	oldContent: string,

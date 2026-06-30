@@ -141,10 +141,6 @@ class OutputAccumulator {
 		});
 	}
 
-	getLastLineBytes(): number {
-		return this.currentLineBytes;
-	}
-
 	private appendDecodedText(text: string): void {
 		if (text.length === 0) return;
 		const bytes = byteLength(text);

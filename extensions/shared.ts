@@ -13,10 +13,8 @@ import {
 
 export type { TextContent } from "@earendil-works/pi-ai";
 export {
-	constants,
 	createReadStream,
 	createWriteStream,
-	access,
 	mkdir,
 	readFile,
 	stat,
