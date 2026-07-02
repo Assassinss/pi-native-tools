@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import extension from "../index.ts";
@@ -52,11 +52,11 @@ test("registered tools work end-to-end through extension entry", async () => {
 			undefined,
 			{ cwd: dir },
 		);
-		assert.match(extractText(readResult), /^1:[a-f0-9]{8}\|alpha beta gamma/m);
+		const hashline = extractText(readResult).match(/^(\d+:[a-f0-9]{8})\|/)![1]!;
 
 		const editResult = await edit!.execute(
 			"3",
-			{ path: file, edits: [{ oldText: "beta", newText: "delta" }] },
+			{ path: file, edits: [{ hashline, newText: "alpha delta gamma" }] },
 			undefined,
 			undefined,
 			{ cwd: dir },
@@ -143,7 +143,7 @@ test("registered tools apply multiple hashline edits from one read snapshot", as
 				}),
 		);
 
-		await edit!.execute(
+		const editResult = await edit!.execute(
 			"3",
 			{
 				path: file,
@@ -157,9 +157,61 @@ test("registered tools apply multiple hashline edits from one read snapshot", as
 			undefined,
 			{ cwd: dir },
 		);
+		assert.match(extractText(editResult), /revisionId: rev_/);
+		assert.match(extractText(editResult), /\[changed lines /);
+		assert.match(extractText(editResult), /\d+:[a-f0-9]{8}\|THIRD/);
 
 		const finalContent = await readFile(file, "utf-8");
 		assert.equal(finalContent, "first\nsecond\ninserted-1\ninserted-2\nTHIRD\ntail");
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("registered tools rebase stale hashlines across consecutive edits", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-hashline-rebase-"));
+	try {
+		const pi = createPiStub();
+		extension(pi as any);
+		const read = pi.tools.get("read");
+		const write = pi.tools.get("write");
+		const edit = pi.tools.get("edit");
+		assert.ok(read);
+		assert.ok(write);
+		assert.ok(edit);
+
+		const file = join(dir, "hashline-rebase.txt");
+		await write!.execute("1", { path: file, content: "first\nsecond\nthird\n" }, undefined, undefined, { cwd: dir });
+		const readResult = await read!.execute("2", { path: file, withHashlines: true }, undefined, undefined, { cwd: dir });
+		const readText = extractText(readResult);
+		const revisionId = (readResult.details as { revisionId?: string } | undefined)?.revisionId;
+		assert.ok(revisionId);
+		const secondHashline = readText.split("\n").find((line) => line.includes("|second"))?.split("|", 2)[0];
+		const thirdHashline = readText.split("\n").find((line) => line.includes("|third"))?.split("|", 2)[0];
+		assert.ok(secondHashline);
+		assert.ok(thirdHashline);
+
+		await edit!.execute(
+			"3",
+			{ path: file, baseRevisionId: revisionId, edits: [{ hashline: secondHashline, newText: "inserted-1\ninserted-2", wholeLine: false }] },
+			undefined,
+			undefined,
+			{ cwd: dir },
+		);
+		const secondEdit = await edit!.execute(
+			"4",
+			{ path: file, baseRevisionId: revisionId, edits: [{ hashline: thirdHashline, newText: "THIRD" }] },
+			undefined,
+			undefined,
+			{ cwd: dir },
+		);
+		assert.match(extractText(secondEdit), /automatic rebase/);
+		const details = secondEdit.details as { rebaseState?: string; changedRanges?: Array<{ hashlines: string[] }> } | undefined;
+		assert.equal(details?.rebaseState, "rebased");
+		assert.ok(details?.changedRanges?.some((range) => range.hashlines.some((line) => line.includes("|THIRD"))));
+
+		const finalContent = await readFile(file, "utf-8");
+		assert.equal(finalContent, "first\nsecond\ninserted-1\ninserted-2\nTHIRD\n");
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
@@ -194,6 +246,56 @@ test("registered read supports explicit ranges with context", async () => {
 		assert.match(text, /\[lines 3-6 \| requested lines 4-5 \| context -1\/\+1\]/);
 		assert.match(text, /3\|line-3/);
 		assert.match(text, /6\|line-6/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("registered tools rebase stale hashlines after streaming read", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-hashline-stream-rebase-"));
+	try {
+		const pi = createPiStub();
+		extension(pi as any);
+		const read = pi.tools.get("read");
+		const write = pi.tools.get("write");
+		const edit = pi.tools.get("edit");
+		assert.ok(read);
+		assert.ok(write);
+		assert.ok(edit);
+
+		const file = join(dir, "hashline-stream-rebase.txt");
+		const content = Array.from({ length: 400000 }, (_, i) => `line-${i + 1}`).join("\n") + "\n";
+		await write!.execute("1", { path: file, content }, undefined, undefined, { cwd: dir });
+		const readResult = await read!.execute(
+			"2",
+			{ path: file, offset: 1, limit: 3, withHashlines: true },
+			undefined,
+			undefined,
+			{ cwd: dir },
+		);
+		const readText = extractText(readResult);
+		const revisionId = (readResult.details as { revisionId?: string } | undefined)?.revisionId;
+		assert.ok(revisionId);
+		const thirdHashline = readText.split("\n").find((line) => line.includes("|line-3"))?.split("|", 2)[0];
+		assert.ok(thirdHashline);
+
+		await edit!.execute(
+			"3",
+			{ path: file, baseRevisionId: revisionId, edits: [{ hashline: readText.split("\n").find((line) => line.includes("|line-2"))?.split("|", 2)[0], newText: "inserted-a\ninserted-b", wholeLine: false }] },
+			undefined,
+			undefined,
+			{ cwd: dir },
+		);
+		const secondEdit = await edit!.execute(
+			"4",
+			{ path: file, baseRevisionId: revisionId, edits: [{ hashline: thirdHashline, newText: "LINE-3" }] },
+			undefined,
+			undefined,
+			{ cwd: dir },
+		);
+		assert.match(extractText(secondEdit), /automatic rebase/);
+		const finalContent = await readFile(file, "utf-8");
+		assert.match(finalContent, /^line-1\nline-2\ninserted-a\ninserted-b\nLINE-3\n/);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
@@ -293,11 +395,11 @@ test("registered native bash supports session controls", async () => {
 
 		await bash!.execute("1", { command: "cd .. && pwd", session: false }, undefined, undefined, { cwd: dir });
 		const noSession = await bash!.execute("2", { command: "pwd", session: false }, undefined, undefined, { cwd: dir });
-		assert.equal(extractText(noSession).trim(), dir);
+		assert.equal(await realpath(extractText(noSession).trim()), await realpath(dir));
 
 		await bash!.execute("3", { command: "cd .." }, undefined, undefined, { cwd: dir });
 		const reset = await bash!.execute("4", { command: "pwd", resetSession: true }, undefined, undefined, { cwd: dir });
-		assert.equal(extractText(reset).trim(), dir);
+		assert.equal(await realpath(extractText(reset).trim()), await realpath(dir));
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}

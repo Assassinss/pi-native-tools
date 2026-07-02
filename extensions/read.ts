@@ -18,6 +18,9 @@ import {
 	throwIfAborted,
 	truncateHead,
 	toolError,
+	rememberDocumentSnapshot,
+	rememberDocumentLineSnapshot,
+	createRevisionId,
 } from "./shared.ts";
 
 function readError(code: string, message: string, hint?: string, details?: Record<string, unknown>): Error {
@@ -244,7 +247,7 @@ export async function executeReadStreaming(
 	withHashlines: boolean | undefined,
 	fileStat: { size: number },
 	signal: AbortSignal | undefined,
-): Promise<{ content: TextContent[]; details: ReadToolDetails | undefined }> {
+): Promise<{ content: TextContent[]; details: (ReadToolDetails & { revisionId?: string }) | undefined }> {
 	const startLine = offset ? Math.max(0, offset - 1) : 0;
 	const maxTargetLines = limit ?? DEFAULT_MAX_LINES;
 
@@ -265,6 +268,9 @@ export async function executeReadStreaming(
 		signal?.addEventListener("abort", onAbort, { once: true });
 
 		const lines: string[] = [];
+		const lineSnapshotEntries: Array<{ lineNumber: number; line: string }> = [];
+		const revisionSeed = `${absolutePath}:${fileStat.size}:${offset ?? 1}:${limit ?? DEFAULT_MAX_LINES}`;
+		const revisionId = createRevisionId(revisionSeed);
 		let lineIndex = 0;
 		let buf = "";
 		let done = false;
@@ -291,6 +297,7 @@ export async function executeReadStreaming(
 
 				if (lineIndex >= startLine && lines.length < maxTargetLines) {
 					lines.push(line);
+					lineSnapshotEntries.push({ lineNumber: lineIndex + 1, line });
 				}
 				lineIndex++;
 
@@ -308,6 +315,7 @@ export async function executeReadStreaming(
 			endsWithNewline = buf.length === 0;
 			if (buf.length > 0 && lineIndex >= startLine && lines.length < maxTargetLines) {
 				lines.push(buf);
+				lineSnapshotEntries.push({ lineNumber: lineIndex + 1, line: buf });
 			}
 			done = true;
 			finalize();
@@ -332,7 +340,11 @@ export async function executeReadStreaming(
 				const outputText = outputLines.map((line, i) => formatReadLine(line, startLine + i + 1, withHashlines)).join("\n");
 				const truncation = truncateHead(outputText);
 				let finalText = truncation.content;
-				const details: ReadToolDetails = {};
+				if (endsWithNewline && lineIndex >= startLine && lines.length < maxTargetLines) {
+					lineSnapshotEntries.push({ lineNumber: startLine + outputLines.length, line: "" });
+				}
+				rememberDocumentLineSnapshot(absolutePath, revisionId, lineSnapshotEntries);
+				const details: ReadToolDetails & { revisionId?: string } = { revisionId };
 
 				if (truncation.truncated || hitTargetLines) {
 					const shownLines = truncation.truncated ? truncation.outputLines : outputLines.length;
@@ -360,7 +372,7 @@ async function executeReadRangesStreaming(
 	ranges: NormalizedReadRange[],
 	withHashlines: boolean | undefined,
 	signal: AbortSignal | undefined,
-): Promise<{ content: TextContent[]; details: ReadToolDetails | undefined }> {
+): Promise<{ content: TextContent[]; details: (ReadToolDetails & { revisionId?: string }) | undefined }> {
 	const mergedBlocks = mergeReadRangeBlocks(ranges);
 	const collectedBlocks: CollectedReadRangeBlock[] = mergedBlocks.map((block) => ({
 		requests: block.requests,
@@ -368,6 +380,8 @@ async function executeReadRangesStreaming(
 		requestedDisplayEnd: block.displayEnd,
 		lines: [],
 	}));
+	const revisionSeed = `${absolutePath}:${ranges.map((range) => `${range.displayStart}-${range.displayEnd}`).join(",")}`;
+	const revisionId = createRevisionId(revisionSeed);
 	const maxDisplayEnd = Math.max(...mergedBlocks.map((block) => block.displayEnd));
 
 	return new Promise((resolve, reject) => {
@@ -402,6 +416,7 @@ async function executeReadRangesStreaming(
 			const block = collectedBlocks[currentBlockIndex]!;
 			if (lineNumber >= block.requestedDisplayStart && lineNumber <= block.requestedDisplayEnd) {
 				block.lines.push({ lineNumber, line });
+				rememberDocumentLineSnapshot(absolutePath, revisionId, [{ lineNumber, line }]);
 			}
 			if (lineNumber >= maxDisplayEnd) {
 				finalizeOnClose = true;
@@ -463,14 +478,14 @@ async function executeReadRangesStreaming(
 				if (totalLines !== undefined && ranges.every((range) => range.start > totalLines)) {
 					resolve({
 						content: [{ type: "text", text: formatOffsetOutOfRangeMessage(ranges[0]!.start, totalLines) }],
-						details: undefined,
+						details: { revisionId },
 					});
 					return;
 				}
 
 				const body = formatCollectedRangeBlocks(collectedBlocks, withHashlines);
 				const notices = totalLines !== undefined ? buildRangeNotices(ranges, totalLines) : [];
-				const details: ReadToolDetails = {};
+				const details: ReadToolDetails & { revisionId?: string } = { revisionId };
 				const response = appendRangeFooter(body, notices, details);
 				resolve({ content: [{ type: "text", text: response.text }], details: response.details });
 			} catch (err: any) {
@@ -488,7 +503,7 @@ export async function executeRead(
 	signal: AbortSignal | undefined,
 	cwd: string,
 	ranges?: ReadRangeRequest[],
-): Promise<{ content: TextContent[]; details: ReadToolDetails | undefined }> {
+): Promise<{ content: TextContent[]; details: (ReadToolDetails & { revisionId?: string }) | undefined }> {
 	validateReadArguments(offset, limit, ranges);
 	const normalizedRanges = ranges && ranges.length > 0 ? normalizeReadRanges(ranges) : undefined;
 	const absolutePath = normalizePath(path, cwd);
@@ -504,8 +519,10 @@ export async function executeRead(
 	const buffer = await readFile(absolutePath);
 	throwIfAborted(signal);
 	detectBinaryContent(buffer, path);
+	const rawContent = buffer.toString("utf-8");
+	const revisionId = rememberDocumentSnapshot(absolutePath, rawContent);
 
-	const { lines: fileLines, endsWithNewline } = splitContentLines(buffer.toString("utf-8"));
+	const { lines: fileLines, endsWithNewline } = splitContentLines(rawContent);
 	const allLines = endsWithNewline ? fileLines.concat("") : fileLines;
 	const totalFileLines = allLines.length;
 
@@ -513,12 +530,12 @@ export async function executeRead(
 		if (normalizedRanges.every((range) => range.start > totalFileLines)) {
 			return {
 				content: [{ type: "text", text: formatOffsetOutOfRangeMessage(normalizedRanges[0]!.start, totalFileLines) }],
-				details: undefined,
+				details: { revisionId },
 			};
 		}
 		const blocks = buildRangeBlocksFromLines(allLines, normalizedRanges, totalFileLines);
 		const body = formatCollectedRangeBlocks(blocks, withHashlines);
-		const details: ReadToolDetails = {};
+		const details: ReadToolDetails & { revisionId?: string } = { revisionId };
 		const response = appendRangeFooter(body, buildRangeNotices(normalizedRanges, totalFileLines), details);
 		return { content: [{ type: "text", text: response.text }], details: response.details };
 	}
@@ -527,7 +544,7 @@ export async function executeRead(
 	if (offset !== undefined && startLine >= allLines.length) {
 		return {
 			content: [{ type: "text", text: formatOffsetOutOfRangeMessage(offset, allLines.length) }],
-			details: undefined,
+			details: { revisionId },
 		};
 	}
 
@@ -535,7 +552,7 @@ export async function executeRead(
 	const outputText = selectedLines.map((line, i) => formatReadLine(line, startLine + i + 1, withHashlines)).join("\n");
 	const truncation = truncateHead(outputText);
 	let finalText = truncation.content;
-	const details: ReadToolDetails = {};
+	const details: ReadToolDetails & { revisionId?: string } = { revisionId };
 
 	if (truncation.truncated) {
 		const nextOffset = startLine + truncation.outputLines + 1;

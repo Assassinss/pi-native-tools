@@ -1,19 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile, chmod } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile, chmod, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	applyHashlineEdits,
-	applyTextEdits,
 	generateStructuredPatch,
 	formatStructuredPatch,
 	generateDiffStringFromPatch,
 	parseHashline,
-	prepareEditArguments,
 	validateEditInput,
 	verifyHashline,
 	registerEditTool,
+	collectChangedRanges,
 } from "../extensions/edit.ts";
 import { executeRead } from "../extensions/read.ts";
 import { executeWrite } from "../extensions/write.ts";
@@ -36,55 +35,6 @@ test("verifyHashline matches current content", () => {
 	const line = "const x = 1;";
 	assert.equal(verifyHashline(line, shortHash(line)), true);
 	assert.equal(verifyHashline(line, shortHash("const x = 2;")), false);
-});
-
-test("applyTextEdits replaces unique exact match", () => {
-	const result = applyTextEdits("hello world", [{ oldText: "world", newText: "pi" }], "a.txt");
-	assert.equal(result, "hello pi");
-});
-
-test("applyTextEdits rejects non-unique match", () => {
-	assert.throws(
-		() => applyTextEdits("x\ny\nx", [{ oldText: "x", newText: "z" }], "a.txt"),
-		/appears multiple times/,
-	);
-});
-
-test("applyTextEdits resolves all matches against the original content", () => {
-	const result = applyTextEdits(
-		"alpha beta gamma",
-		[
-			{ oldText: "alpha", newText: "A" },
-			{ oldText: "gamma", newText: "G" },
-		],
-		"a.txt",
-	);
-	assert.equal(result, "A beta G");
-});
-
-test("applyTextEdits rejects overlapping edits", () => {
-	assert.throws(
-		() =>
-			applyTextEdits(
-				"abcdef",
-				[
-					{ oldText: "abc", newText: "A" },
-					{ oldText: "bcd", newText: "B" },
-				],
-				"a.txt",
-			),
-		/overlap/,
-	);
-});
-
-test("applyTextEdits handles one edit without changing semantics", () => {
-	const result = applyTextEdits("prefix target suffix", [{ oldText: "target", newText: "done" }], "a.txt");
-	assert.equal(result, "prefix done suffix");
-});
-
-test("applyTextEdits matches LF oldText against CRLF content", () => {
-	const result = applyTextEdits("alpha\r\nbeta\r\n", [{ oldText: "alpha\nbeta\n", newText: "done\n" }], "a.txt");
-	assert.equal(result, "done\n");
 });
 
 test("applyHashlineEdits replaces whole line", () => {
@@ -167,6 +117,15 @@ test("generateDiffStringFromPatch collapses large unchanged regions instead of s
 	assert.match(diff.diff, /changed-before-end/);
 });
 
+test("collectChangedRanges truncates large windows for model reuse", () => {
+	const oldContent = ["a", "b", "c", "d"].join("\n");
+	const newContent = ["a", ...Array.from({ length: 20 }, (_, i) => `insert-${i + 1}`), "b", "c", "d"].join("\n");
+	const ranges = collectChangedRanges(oldContent, newContent);
+	assert.equal(ranges.length, 1);
+	assert.equal(ranges[0]?.hashlines.length, 12);
+	assert.equal(ranges[0]?.truncated, true);
+});
+
 test("edit rejects repeated identical no-op edits", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-noop-"));
 	try {
@@ -182,7 +141,7 @@ test("edit rejects repeated identical no-op edits", async () => {
 			await assert.rejects(
 				editDef.execute(
 					"1",
-					{ path: file, edits: [{ oldText: "alpha", newText: "alpha" }] },
+					{ path: file, edits: [{ hashline: `1:${shortHash("alpha")}`, newText: "alpha" }] },
 					undefined,
 					undefined,
 					{ cwd: dir },
@@ -213,7 +172,7 @@ test("edit verifies on-disk bytes after write", async () => {
 		} as any);
 		await editDef.execute(
 			"1",
-			{ path: file, edits: [{ oldText: "beta", newText: "delta" }] },
+			{ path: file, edits: [{ hashline: `1:${shortHash("alpha beta")}`, newText: "alpha delta" }] },
 			undefined,
 			undefined,
 			{ cwd: dir },
@@ -224,48 +183,65 @@ test("edit verifies on-disk bytes after write", async () => {
 	}
 });
 
-test("prepareEditArguments supports legacy flat format and JSON string edits", () => {
-	const legacy = prepareEditArguments({ path: "a.txt", oldText: "a", newText: "b" });
-	assert.deepEqual(legacy, { path: "a.txt", edits: [{ oldText: "a", newText: "b" }] });
+test("edit requests refresh when stale hashline cannot be safely rebased", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-refresh-"));
+	try {
+		const file = join(dir, "refresh.txt");
+		await writeFile(file, "first\nsecond\nthird\n", "utf-8");
+		const readResult = await executeRead(file, undefined, undefined, true, undefined, dir);
+		const revisionId = (readResult.details as { revisionId?: string } | undefined)?.revisionId;
+		assert.ok(revisionId);
+		const thirdHashline = extractText(readResult)
+			.split("\n")
+			.find((line) => line.includes("|third"))
+			?.split("|", 2)[0];
+		assert.ok(thirdHashline);
+		await writeFile(file, "first\nsecond\nchanged externally\n", "utf-8");
 
-	const jsonEdits = prepareEditArguments({ path: "a.txt", edits: '[{"oldText":"a","newText":"b"}]' });
-	assert.deepEqual(jsonEdits, { path: "a.txt", edits: [{ oldText: "a", newText: "b" }] });
+		let editDef: any;
+		registerEditTool({
+			registerTool(def: any) {
+				editDef = def;
+			},
+		} as any);
+		await assert.rejects(
+			editDef.execute(
+				"1",
+				{ path: file, baseRevisionId: revisionId, edits: [{ hashline: thirdHashline, newText: "THIRD" }] },
+				undefined,
+				undefined,
+				{ cwd: dir },
+			),
+			(error: unknown) => {
+				assert.ok(error instanceof Error);
+				assert.match(error.message, /"code":"needs_refresh"/);
+				return true;
+			},
+		);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
 });
-
-test("validateEditInput separates text and hashline edits", () => {
+test("validateEditInput accepts hashline edits", () => {
 	const validated = validateEditInput({
 		path: "a.txt",
 		edits: [
-			{ oldText: "a", newText: "b" },
 			{ hashline: `1:${shortHash("x")}`, newText: "y" },
 		],
 	});
-	assert.equal(validated.textEdits.length, 1);
-	assert.equal(validated.hashlineEdits.length, 1);
+	assert.equal(validated.edits.length, 1);
+	assert.equal(validated.edits[0]!.hashline, `1:${shortHash("x")}`);
 });
-
-test("validateEditInput rejects edits with both oldText and hashline", () => {
-	assert.throws(
-		() =>
-			validateEditInput({
-				path: "a.txt",
-				edits: [{ oldText: "a", hashline: `1:${shortHash("a")}`, newText: "b" }],
-			}),
-		/both hashline and oldText/,
-	);
-});
-
-test("validateEditInput rejects edits without oldText or hashline", () => {
+test("validateEditInput rejects edits without hashline", () => {
 	assert.throws(
 		() =>
 			validateEditInput({
 				path: "a.txt",
 				edits: [{ newText: "b" }],
 			}),
-		/either oldText .* or hashline/,
+		/missing_hashline/,
 	);
 });
-
 test("executeRead reads offset/limit and hashlines", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-tools-read-"));
 	try {
@@ -378,7 +354,7 @@ test("executeRead returns recoverable guidance for offset out of range", async (
 		const text = result.content[0]?.text ?? "";
 		assert.match(text, /Line 99 is beyond end of file \(3 lines total\)/);
 		assert.match(text, /Use offset=1 to read from the start/);
-		assert.equal(result.details, undefined);
+		assert.ok((result.details as { revisionId?: string } | undefined)?.revisionId);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
@@ -717,7 +693,7 @@ test("executeBashNative supports disabling shell sessions per command", async ()
 	try {
 		await executeBashNative("cd .. && pwd", dir, undefined, undefined, undefined, { session: false });
 		const second = await executeBashNative("pwd", dir, undefined, undefined, undefined, { session: false });
-		assert.equal(extractText(second).trim(), dir);
+		assert.equal(await realpath(extractText(second).trim()), await realpath(dir));
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
@@ -728,7 +704,7 @@ test("executeBashNative resets shell session on demand", async () => {
 	try {
 		await executeBashNative("cd ..", dir, undefined, undefined);
 		const reset = await executeBashNative("pwd", dir, undefined, undefined, undefined, { resetSession: true });
-		assert.equal(extractText(reset).trim(), dir);
+		assert.equal(await realpath(extractText(reset).trim()), await realpath(dir));
 	} finally {
 		clearBashSessions();
 		await rm(dir, { recursive: true, force: true });

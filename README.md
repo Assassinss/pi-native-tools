@@ -23,8 +23,8 @@ pi install git:git@github.com:Assassinss/pi-native-tools.git
 - `bash` - warm native shell sessions for faster repeated commands
 - `find` - native glob search with normalized relative paths
 - `grep` - native in-process search with regex, literal, context, count, and files-with-matches modes
-- `read` - `offset` / `limit`, explicit `ranges`, optional context windows, hashline output, binary/NUL rejection, and large-file streaming
-- `edit` - exact-text and hashline-anchored edits, original-snapshot matching, no-op loop protection, and post-write verification
+- `read` - `offset` / `limit`, explicit `ranges`, optional context windows, hashline output, `details.revisionId`, binary/NUL rejection, and large-file streaming with line-snapshot fallback for later edits
+- `edit` - hashline-anchored edits, original-snapshot matching, `baseRevisionId`-based automatic rebase, `changedRanges` handoff for follow-up edits, no-op loop protection, and post-write verification
 - `write` - parent directory creation, verified writes, large-file streaming, hashline stripping, and shebang executable support on Unix-like systems
 
 ## Examples
@@ -68,6 +68,7 @@ Apply a hashline-based edit:
 ```json
 {
   "path": "src/app.ts",
+  "baseRevisionId": "rev_1234abcd5678",
   "edits": [
     {
       "hashline": "84:a1b2c3d4",
@@ -93,6 +94,21 @@ hello
 world
 ```
 
+## Hashline Continuation Flow
+
+1. `read(..., withHashlines=true)` returns normal hashline output plus `details.revisionId`
+2. `edit(..., baseRevisionId=...)` can safely reuse that snapshot even after nearby line shifts caused by earlier edits in the same tool session
+3. successful `edit` returns:
+   - `details.revisionId` for the new file state
+   - `details.changedRanges` with fresh `LINE:HASH|text` windows near each change
+   - matching text output so the next tool call can often skip another `read`
+4. if the file changed externally and rebase is no longer safe, `edit` fails with `needs_refresh`
+
+`changedRanges` is intentionally capped so tool output stays small enough for the model to keep using it:
+- up to 3 changed hunks
+- up to 12 hashlines per hunk
+- truncated hunks are marked in both text output and `details.changedRanges`
+
 ## Notes
 
 - `read` `ranges` cannot be combined with `offset` / `limit`
@@ -105,4 +121,11 @@ world
 npm install
 npm test
 npm run bench
+npm run test:hashline-flow
 ```
+
+`npm run test:hashline-flow` prints a readable PASS/FAIL summary for:
+- changedRanges reuse without a follow-up `read`
+- automatic rebase from stale hashlines
+- large-file / streaming window fallback
+- external edits correctly returning `needs_refresh`

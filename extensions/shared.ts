@@ -74,6 +74,88 @@ export function fullHash(content: string | Buffer): string {
 	return createHash("sha256").update(content).digest("hex");
 }
 
+const DOCUMENT_HISTORY_LIMIT = 8;
+
+type DocumentHistory = {
+	currentRevisionId: string;
+	snapshots: Map<string, string>;
+	lineSnapshots: Map<string, Map<number, string>>;
+	order: string[];
+};
+
+const documentHistories = new Map<string, DocumentHistory>();
+
+export function createRevisionId(content: string | Buffer): string {
+	return `rev_${fullHash(content).slice(0, 12)}`;
+}
+
+export function rememberDocumentSnapshot(absolutePath: string, content: string): string {
+	const revisionId = createRevisionId(content);
+	let history = documentHistories.get(absolutePath);
+	if (!history) {
+		history = {
+			currentRevisionId: revisionId,
+			snapshots: new Map(),
+			lineSnapshots: new Map(),
+			order: [],
+		};
+		documentHistories.set(absolutePath, history);
+	}
+	history.currentRevisionId = revisionId;
+	if (!history.snapshots.has(revisionId)) history.order.push(revisionId);
+	history.snapshots.set(revisionId, content);
+	while (history.order.length > DOCUMENT_HISTORY_LIMIT) {
+		const staleRevisionId = history.order.shift()!;
+		if (staleRevisionId !== history.currentRevisionId) {
+			history.snapshots.delete(staleRevisionId);
+			history.lineSnapshots.delete(staleRevisionId);
+		}
+	}
+	return revisionId;
+}
+
+export function getDocumentSnapshot(absolutePath: string, revisionId: string): string | undefined {
+	return documentHistories.get(absolutePath)?.snapshots.get(revisionId);
+}
+
+export function rememberDocumentLineSnapshot(
+	absolutePath: string,
+	revisionId: string,
+	lines: Array<{ lineNumber: number; line: string }>,
+): string {
+	let history = documentHistories.get(absolutePath);
+	if (!history) {
+		history = {
+			currentRevisionId: revisionId,
+			snapshots: new Map(),
+			lineSnapshots: new Map(),
+			order: [],
+		};
+		documentHistories.set(absolutePath, history);
+	}
+	history.currentRevisionId = revisionId;
+	if (!history.lineSnapshots.has(revisionId) && !history.snapshots.has(revisionId)) history.order.push(revisionId);
+	const snapshot = history.lineSnapshots.get(revisionId) ?? new Map<number, string>();
+	for (const entry of lines) snapshot.set(entry.lineNumber, entry.line);
+	history.lineSnapshots.set(revisionId, snapshot);
+	while (history.order.length > DOCUMENT_HISTORY_LIMIT) {
+		const staleRevisionId = history.order.shift()!;
+		if (staleRevisionId !== history.currentRevisionId) {
+			history.snapshots.delete(staleRevisionId);
+			history.lineSnapshots.delete(staleRevisionId);
+		}
+	}
+	return revisionId;
+}
+
+export function getDocumentLineSnapshot(absolutePath: string, revisionId: string, lineNumber: number): string | undefined {
+	return documentHistories.get(absolutePath)?.lineSnapshots.get(revisionId)?.get(lineNumber);
+}
+
+export function getCurrentDocumentRevision(absolutePath: string): string | undefined {
+	return documentHistories.get(absolutePath)?.currentRevisionId;
+}
+
 export function normalizePath(path: string, cwd: string): string {
 	let p = path;
 	if (p.startsWith("@")) p = p.slice(1);
