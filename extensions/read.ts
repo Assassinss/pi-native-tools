@@ -579,6 +579,8 @@ export function registerReadTool(pi: ExtensionAPI): void {
 			"Use read when the user wants file contents or you need the exact current text.",
 			"If the user already named the file but wants search, counts, or a direct unique replacement, use grep or edit instead of reading first.",
 			"Use withHashlines=true before hashline-anchored edits to capture fresh LINE:HASH prefixes.",
+			"Keep details.revisionId from read results and pass it back as edit.baseRevisionId on follow-up edits.",
+			"If a prior edit already returned changedRanges for the area you need, prefer reusing those fresh hashlines before issuing another read.",
 			"Use ranges for disjoint line windows or when you need before/after context around specific lines.",
 		],
 		parameters: readSchema,

@@ -499,11 +499,12 @@ export function registerEditTool(pi: ExtensionAPI): void {
     promptSnippet:
       "Make precise file edits with hashline-anchored changes, including multiple disjoint edits in one call",
     promptGuidelines: [
-      "Use read(withHashlines=true) first to capture LINE:HASH prefixes, then pass hashline+newText.",
+      "Use read(withHashlines=true) first to capture LINE:HASH prefixes and keep details.revisionId for follow-up edits.",
+      "Pass baseRevisionId from the latest read or edit result so stale hashlines can be safely rebased within the same tool session.",
+      "After a successful edit, prefer reusing the returned changedRanges hashlines for nearby follow-up edits instead of reading the file again.",
       "Hashline replaces the entire line by default; use wholeLine:false to insert newText after the anchored line instead.",
       "Each edits[] entry is matched against the original file independently, not after earlier edits are applied.",
-      "When changing multiple separate locations, use one edit call with multiple entries in edits[].",
-      "The hashline format is LINE:SHORT_HASH (e.g. 42:a1b2c3d4), captured via read(withHashlines=true).",
+      "If edit returns needs_refresh, issue a new read(withHashlines=true) for the relevant region before retrying.",
     ],
     parameters: editSchema,
     renderShell: builtInEdit.renderShell,
