@@ -24,6 +24,12 @@ import {
   getDocumentLineSnapshot,
   rememberDocumentSnapshot,
 } from "./shared.ts";
+
+
+export const editIo = {
+  readFile: (path: string) => readFile(path),
+  writeFile: (path: string, content: string) => fsWriteFile(path, content, "utf-8"),
+};
 import { invalidateFsScanCache } from "./omp-native.ts";
 
 function editError(
@@ -469,7 +475,7 @@ async function verifyEditWrite(
 ): Promise<void> {
   let writtenContent: string;
   try {
-    writtenContent = (await readFile(absolutePath)).toString("utf-8");
+    writtenContent = (await editIo.readFile(absolutePath)).toString("utf-8");
   } catch (err: any) {
     throw editError(
       "verification_failed",
@@ -524,7 +530,7 @@ export function registerEditTool(pi: ExtensionAPI): void {
         throwIfAborted(signal);
         let content: string;
         try {
-          content = (await readFile(absolutePath)).toString("utf-8");
+          content = (await editIo.readFile(absolutePath)).toString("utf-8");
         } catch (err: any) {
           throwIfAborted(signal);
           if (err.code === "ENOENT") {
@@ -582,7 +588,7 @@ export function registerEditTool(pi: ExtensionAPI): void {
         }
 
         try {
-          await fsWriteFile(absolutePath, newContent, "utf-8");
+          await editIo.writeFile(absolutePath, newContent);
         } catch (err: any) {
           throwIfAborted(signal);
           if (err.code === "EACCES") {

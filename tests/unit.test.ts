@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile, chmod, realpath } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile, chmod, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -14,15 +14,24 @@ import {
 	registerEditTool,
 	collectChangedRanges,
 } from "../extensions/edit.ts";
+
+import { editIo } from "../extensions/edit.ts";
 import { executeRead } from "../extensions/read.ts";
 import { executeWrite } from "../extensions/write.ts";
-import { shortHash } from "../extensions/shared.ts";
+import { getDocumentLineSnapshot, getDocumentSnapshot, shortHash } from "../extensions/shared.ts";
 import { executeFindNative } from "../extensions/find.ts";
 import { executeGrepNative } from "../extensions/grep.ts";
 import { clearBashSessions, executeBashNative, getBashSessionCount } from "../extensions/bash.ts";
 
 function extractText(result: { content: Array<{ type: string; text: string }> }): string {
 	return result.content.map((item) => item.text).join("\n");
+}
+
+
+function captureToolErrorCode(error: unknown): string | undefined {
+	if (!(error instanceof Error)) return undefined;
+	const match = error.message.match(/"code":"([^"]+)"/);
+	return match?.[1];
 }
 
 test("parseHashline parses valid anchor", () => {
@@ -61,6 +70,48 @@ test("applyHashlineEdits rejects hash mismatch", () => {
 			assert.match(error.message, /^TOOL_ERROR /);
 			assert.match(error.message, /"code":"hashline_mismatch"/);
 			assert.match(error.message, /hashline mismatch/);
+			return true;
+		},
+	);
+});
+
+
+test("applyHashlineEdits rejects invalid hashline format", () => {
+	assert.throws(
+		() => applyHashlineEdits("a\nb", [{ hashline: "line-2", newText: "B" }], "a.txt"),
+		(error: unknown) => {
+			assert.ok(error instanceof Error);
+			assert.match(error.message, /"code":"invalid_hashline_format"/);
+			return true;
+		},
+	);
+});
+
+test("applyHashlineEdits rejects out-of-range hashlines", () => {
+	assert.throws(
+		() => applyHashlineEdits("a\nb", [{ hashline: `3:${shortHash("")}`, newText: "B" }], "a.txt"),
+		(error: unknown) => {
+			assert.ok(error instanceof Error);
+			assert.match(error.message, /"code":"hashline_out_of_range"/);
+			return true;
+		},
+	);
+});
+
+test("applyHashlineEdits rejects duplicate targets in one batch", () => {
+	assert.throws(
+		() =>
+			applyHashlineEdits(
+				"a\nb\nc",
+				[
+					{ hashline: `2:${shortHash("b")}`, newText: "B" },
+					{ hashline: `2:${shortHash("b")}`, newText: "inserted", wholeLine: false },
+				],
+				"a.txt",
+			),
+		(error: unknown) => {
+			assert.ok(error instanceof Error);
+			assert.match(error.message, /"code":"duplicate_hashline_target"/);
 			return true;
 		},
 	);
@@ -183,6 +234,87 @@ test("edit verifies on-disk bytes after write", async () => {
 	}
 });
 
+
+test("edit returns verification_failed when written file cannot be re-read", async (t) => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-verify-reread-"));
+	const originalReadFile = editIo.readFile;
+	try {
+		const file = join(dir, "verify-reread.txt");
+		await writeFile(file, "alpha beta\n", "utf-8");
+		let fileReadCount = 0;
+		const readMock = t.mock.method(editIo, "readFile", async (path: string) => {
+			if (String(path) === file && ++fileReadCount > 1) {
+				const err = new Error("boom") as NodeJS.ErrnoException;
+				err.code = "EIO";
+				throw err;
+			}
+			return originalReadFile(path);
+		});
+
+		let editDef: any;
+		registerEditTool({
+			registerTool(def: any) {
+				editDef = def;
+			},
+		} as any);
+		await assert.rejects(
+			editDef.execute(
+				"1",
+				{ path: file, edits: [{ hashline: `1:${shortHash("alpha beta")}`, newText: "alpha delta" }] },
+				undefined,
+				undefined,
+				{ cwd: dir },
+			),
+			(error: unknown) => {
+				assert.equal(captureToolErrorCode(error), "verification_failed");
+				assert.match((error as Error).message, /failed to re-read the file/);
+				return true;
+			},
+		);
+		assert.equal(fileReadCount, 2);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("edit returns verification_failed when disk content differs after write", async (t) => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-verify-mismatch-"));
+	const originalReadFile = editIo.readFile;
+	try {
+		const file = join(dir, "verify-mismatch.txt");
+		await writeFile(file, "alpha beta\n", "utf-8");
+		let fileReadCount = 0;
+		t.mock.method(editIo, "readFile", async (path: string) => {
+			if (String(path) === file && ++fileReadCount > 1) return Buffer.from("corrupted\n", "utf-8");
+			return originalReadFile(path);
+		});
+
+		let editDef: any;
+		registerEditTool({
+			registerTool(def: any) {
+				editDef = def;
+			},
+		} as any);
+		await assert.rejects(
+			editDef.execute(
+				"1",
+				{ path: file, edits: [{ hashline: `1:${shortHash("alpha beta")}`, newText: "alpha delta" }] },
+				undefined,
+				undefined,
+				{ cwd: dir },
+			),
+			(error: unknown) => {
+				assert.equal(captureToolErrorCode(error), "verification_failed");
+				assert.match((error as Error).message, /disk content differs/);
+				return true;
+			},
+		);
+	} finally {
+		assert.equal(typeof fileReadCount === "number" ? fileReadCount : 2, 2);
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
 test("edit requests refresh when stale hashline cannot be safely rebased", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-refresh-"));
 	try {
@@ -222,6 +354,298 @@ test("edit requests refresh when stale hashline cannot be safely rebased", async
 		await rm(dir, { recursive: true, force: true });
 	}
 });
+
+
+test("edit rebases stale hashline using surrounding context when content is duplicated", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-rebase-context-"));
+	try {
+		const file = join(dir, "rebase-context.txt");
+		await writeFile(file, "alpha\ntarget\nomega\nalpha\ntarget\nbeta\n", "utf-8");
+		const readResult = await executeRead(file, undefined, undefined, true, undefined, dir);
+		const revisionId = (readResult.details as { revisionId?: string } | undefined)?.revisionId;
+		assert.ok(revisionId);
+		const targetHashline = extractText(readResult)
+			.split("\n")
+			.find((line) => line.startsWith("2:") && line.includes("|target"))
+			?.split("|", 2)[0];
+		assert.ok(targetHashline);
+		await writeFile(file, "intro\nalpha\ntarget\nomega\nalpha\ntarget\nbeta\n", "utf-8");
+
+		let editDef: any;
+		registerEditTool({
+			registerTool(def: any) {
+				editDef = def;
+			},
+		} as any);
+		const result = await editDef.execute(
+			"1",
+			{ path: file, baseRevisionId: revisionId, edits: [{ hashline: targetHashline, newText: "TARGET" }] },
+			undefined,
+			undefined,
+			{ cwd: dir },
+		);
+		assert.match(extractText(result), /automatic rebase/);
+		assert.equal(await readFile(file, "utf-8"), "intro\nalpha\nTARGET\nomega\nalpha\ntarget\nbeta\n");
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("edit requests refresh when duplicated content stays ambiguous after rebase", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-rebase-ambiguous-"));
+	try {
+		const file = join(dir, "rebase-ambiguous.txt");
+		await writeFile(file, "alpha\ntarget\nomega\nalpha\ntarget\nomega\n", "utf-8");
+		const readResult = await executeRead(file, undefined, undefined, true, undefined, dir);
+		const revisionId = (readResult.details as { revisionId?: string } | undefined)?.revisionId;
+		assert.ok(revisionId);
+		const targetHashline = extractText(readResult)
+			.split("\n")
+			.find((line) => line.startsWith("2:") && line.includes("|target"))
+			?.split("|", 2)[0];
+		assert.ok(targetHashline);
+		await writeFile(file, "intro\nalpha\ntarget\nomega\nalpha\ntarget\nomega\n", "utf-8");
+
+		let editDef: any;
+		registerEditTool({
+			registerTool(def: any) {
+				editDef = def;
+			},
+		} as any);
+		await assert.rejects(
+			editDef.execute(
+				"1",
+				{ path: file, baseRevisionId: revisionId, edits: [{ hashline: targetHashline, newText: "TARGET" }] },
+				undefined,
+				undefined,
+				{ cwd: dir },
+			),
+			(error: unknown) => {
+				assert.ok(error instanceof Error);
+				assert.match(error.message, /"code":"needs_refresh"/);
+				return true;
+			},
+		);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("edit rebases from streaming line snapshots when full snapshot is unavailable", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-stream-snapshot-"));
+	try {
+		const file = join(dir, "stream-snapshot.txt");
+		const content = Array.from({ length: 600000 }, (_, i) => (i === 2 ? "target" : `line-${i + 1}`)).join("\n") + "\n";
+		await writeFile(file, content, "utf-8");
+		const readResult = await executeRead(file, 1, 3, true, undefined, dir);
+		const revisionId = (readResult.details as { revisionId?: string } | undefined)?.revisionId;
+		assert.ok(revisionId);
+		assert.equal(getDocumentSnapshot(file, revisionId), undefined);
+		assert.equal(getDocumentLineSnapshot(file, revisionId, 3), "target");
+		const targetHashline = extractText(readResult)
+			.split("\n")
+			.find((line) => line.startsWith("3:") && line.includes("|target"))
+			?.split("|", 2)[0];
+		assert.ok(targetHashline);
+		await writeFile(file, `intro\n${content}`, "utf-8");
+
+		let editDef: any;
+		registerEditTool({
+			registerTool(def: any) {
+				editDef = def;
+			},
+		} as any);
+		const result = await editDef.execute(
+			"1",
+			{ path: file, baseRevisionId: revisionId, edits: [{ hashline: targetHashline, newText: "TARGET" }] },
+			undefined,
+			undefined,
+			{ cwd: dir },
+		);
+		assert.match(extractText(result), /automatic rebase/);
+		const finalContent = await readFile(file, "utf-8");
+		assert.match(finalContent, /^intro\nline-1\nline-2\nTARGET\n/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("edit returns file_not_found for missing files", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-missing-"));
+	try {
+		let editDef: any;
+		registerEditTool({
+			registerTool(def: any) {
+				editDef = def;
+			},
+		} as any);
+		await assert.rejects(
+			editDef.execute(
+				"1",
+				{ path: join(dir, "missing.txt"), edits: [{ hashline: `1:${shortHash("")}`, newText: "x" }] },
+				undefined,
+				undefined,
+				{ cwd: dir },
+			),
+			(error: unknown) => {
+				assert.ok(error instanceof Error);
+				assert.match(error.message, /"code":"file_not_found"/);
+				return true;
+			},
+		);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("edit returns read_failed for directory paths", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-read-failed-"));
+	try {
+		const target = join(dir, "not-a-file");
+		await mkdir(target);
+
+		let editDef: any;
+		registerEditTool({
+			registerTool(def: any) {
+				editDef = def;
+			},
+		} as any);
+		await assert.rejects(
+			editDef.execute(
+				"1",
+				{ path: target, edits: [{ hashline: `1:${shortHash("")}`, newText: "x" }] },
+				undefined,
+				undefined,
+				{ cwd: dir },
+			),
+			(error: unknown) => {
+				assert.ok(error instanceof Error);
+				assert.match(error.message, /"code":"read_failed"/);
+				return true;
+			},
+		);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+
+test("edit returns permission_denied when initial read gets EACCES", async (t) => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-read-eacces-"));
+	const originalReadFile = editIo.readFile;
+	try {
+		const file = join(dir, "read-eacces.txt");
+		await writeFile(file, "alpha\n", "utf-8");
+		t.mock.method(editIo, "readFile", async (path: string) => {
+			if (String(path) === file) {
+				const err = new Error("denied") as NodeJS.ErrnoException;
+				err.code = "EACCES";
+				throw err;
+			}
+			return originalReadFile(path);
+		});
+
+		let editDef: any;
+		registerEditTool({
+			registerTool(def: any) {
+				editDef = def;
+			},
+		} as any);
+		await assert.rejects(
+			editDef.execute(
+				"1",
+				{ path: file, edits: [{ hashline: `1:${shortHash("alpha")}`, newText: "beta" }] },
+				undefined,
+				undefined,
+				{ cwd: dir },
+			),
+			(error: unknown) => {
+				assert.equal(captureToolErrorCode(error), "permission_denied");
+				return true;
+			},
+		);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("edit returns permission_denied_write when write gets EACCES", async (t) => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-write-eacces-"));
+	const originalWriteFile = editIo.writeFile;
+	try {
+		const file = join(dir, "write-eacces.txt");
+		await writeFile(file, "alpha\n", "utf-8");
+		t.mock.method(editIo, "writeFile", async (path: string, content: string) => {
+			if (String(path) === file) {
+				const err = new Error("denied") as NodeJS.ErrnoException;
+				err.code = "EACCES";
+				throw err;
+			}
+			return originalWriteFile(path, content);
+		});
+
+		let editDef: any;
+		registerEditTool({
+			registerTool(def: any) {
+				editDef = def;
+			},
+		} as any);
+		await assert.rejects(
+			editDef.execute(
+				"1",
+				{ path: file, edits: [{ hashline: `1:${shortHash("alpha")}`, newText: "beta" }] },
+				undefined,
+				undefined,
+				{ cwd: dir },
+			),
+			(error: unknown) => {
+				assert.equal(captureToolErrorCode(error), "permission_denied_write");
+				return true;
+			},
+		);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("edit returns disk_full when write gets ENOSPC", async (t) => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-write-enospc-"));
+	const originalWriteFile = editIo.writeFile;
+	try {
+		const file = join(dir, "write-enospc.txt");
+		await writeFile(file, "alpha\n", "utf-8");
+		t.mock.method(editIo, "writeFile", async (path: string, content: string) => {
+			if (String(path) === file) {
+				const err = new Error("full") as NodeJS.ErrnoException;
+				err.code = "ENOSPC";
+				throw err;
+			}
+			return originalWriteFile(path, content);
+		});
+
+		let editDef: any;
+		registerEditTool({
+			registerTool(def: any) {
+				editDef = def;
+			},
+		} as any);
+		await assert.rejects(
+			editDef.execute(
+				"1",
+				{ path: file, edits: [{ hashline: `1:${shortHash("alpha")}`, newText: "beta" }] },
+				undefined,
+				undefined,
+				{ cwd: dir },
+			),
+			(error: unknown) => {
+				assert.equal(captureToolErrorCode(error), "disk_full");
+				return true;
+			},
+		);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
 test("validateEditInput accepts hashline edits", () => {
 	const validated = validateEditInput({
 		path: "a.txt",
@@ -240,6 +664,14 @@ test("validateEditInput rejects edits without hashline", () => {
 				edits: [{ newText: "b" }],
 			}),
 		/missing_hashline/,
+	);
+});
+
+
+test("validateEditInput rejects empty edit batches", () => {
+	assert.throws(
+		() => validateEditInput({ path: "a.txt", edits: [] }),
+		/invalid_input/,
 	);
 });
 test("executeRead reads offset/limit and hashlines", async () => {
