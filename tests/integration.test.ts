@@ -45,23 +45,18 @@ test("registered tools work end-to-end through extension entry", async () => {
 
 		const file = join(dir, "e2e.txt");
 		await write!.execute("1", { path: file, content: "alpha beta gamma" }, undefined, undefined, { cwd: dir });
-		const readResult = await read!.execute(
-			"2",
-			{ path: file, offset: 1, limit: 1, withHashlines: true },
-			undefined,
-			undefined,
-			{ cwd: dir },
-		);
-		const hashline = extractText(readResult).match(/^(\d+:[a-f0-9]{8})\|/)![1]!;
+		const readResult = await read!.execute("2", { path: file, offset: 1, limit: 1 }, undefined, undefined, { cwd: dir });
+		const snapshotId = (readResult.details as { snapshotId?: string } | undefined)?.snapshotId;
+		assert.ok(snapshotId);
 
 		const editResult = await edit!.execute(
 			"3",
-			{ path: file, edits: [{ hashline, newText: "alpha delta gamma" }] },
+			{ path: file, snapshotId, oldText: "alpha beta gamma", newText: "alpha delta gamma" },
 			undefined,
 			undefined,
 			{ cwd: dir },
 		);
-		assert.match(extractText(editResult), /Successfully applied 1 edit/);
+		assert.match(extractText(editResult), /Applied 1 replacement/);
 
 		const finalContent = await readFile(file, "utf-8");
 		assert.equal(finalContent, "alpha delta gamma");
@@ -70,8 +65,8 @@ test("registered tools work end-to-end through extension entry", async () => {
 	}
 });
 
-test("registered tools support hashline-guided edit flow", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-tools-hashline-"));
+test("registered edit applies snapshot-based exact replacement", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-"));
 	try {
 		const pi = createPiStub();
 		extension(pi as any);
@@ -82,136 +77,50 @@ test("registered tools support hashline-guided edit flow", async () => {
 		assert.ok(write);
 		assert.ok(edit);
 
-		const file = join(dir, "hashline.txt");
-		await write!.execute("1", { path: file, content: "first\nsecond\nthird" }, undefined, undefined, { cwd: dir });
-		const readResult = await read!.execute(
-			"2",
-			{ path: file, offset: 1, limit: 3, withHashlines: true },
-			undefined,
-			undefined,
-			{ cwd: dir },
-		);
-		const hashline = extractText(readResult)
-			.split("\n")
-			.find((line) => line.includes("|second"))
-			?.split("|", 2)[0];
-		assert.ok(hashline);
+		const file = join(dir, "edit.txt");
+		await write!.execute("1", { path: file, content: "first\nsecond\nthird\n" }, undefined, undefined, { cwd: dir });
+		const readResult = await read!.execute("2", { path: file, offset: 2, limit: 1 }, undefined, undefined, { cwd: dir });
+		const snapshotId = (readResult.details as { snapshotId?: string } | undefined)?.snapshotId;
+		assert.ok(snapshotId);
 
 		await edit!.execute(
 			"3",
-			{ path: file, edits: [{ hashline, newText: "SECOND" }] },
+			{ path: file, snapshotId, oldText: "second", newText: "SECOND" },
 			undefined,
 			undefined,
 			{ cwd: dir },
 		);
 
 		const finalContent = await readFile(file, "utf-8");
-		assert.equal(finalContent, "first\nSECOND\nthird");
+		assert.equal(finalContent, "first\nSECOND\nthird\n");
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
 });
 
-test("registered tools apply multiple hashline edits from one read snapshot", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-tools-hashline-batch-"));
+test("registered edit returns ambiguous conflicts with previews", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-ambiguous-"));
 	try {
 		const pi = createPiStub();
 		extension(pi as any);
-		const read = pi.tools.get("read");
-		const write = pi.tools.get("write");
 		const edit = pi.tools.get("edit");
-		assert.ok(read);
-		assert.ok(write);
+		const write = pi.tools.get("write");
 		assert.ok(edit);
+		assert.ok(write);
 
-		const file = join(dir, "hashline-batch.txt");
-		await write!.execute("1", { path: file, content: "first\nsecond\nthird\n" }, undefined, undefined, { cwd: dir });
-		const readResult = await read!.execute(
+		const file = join(dir, "ambiguous.txt");
+		await write!.execute("1", { path: file, content: "x\nrepeat\ny\nrepeat\n" }, undefined, undefined, { cwd: dir });
+		const result = await edit!.execute(
 			"2",
-			{ path: file, withHashlines: true },
+			{ path: file, oldText: "repeat", newText: "done" },
 			undefined,
 			undefined,
 			{ cwd: dir },
 		);
-		const anchors = new Map(
-			extractText(readResult)
-				.split("\n")
-				.filter((line) => /^\d+:[a-f0-9]{8}\|/.test(line))
-				.map((line) => {
-					const [hashline, content] = line.split("|", 2);
-					return [content, hashline];
-				}),
-		);
-
-		const editResult = await edit!.execute(
-			"3",
-			{
-				path: file,
-				edits: [
-					{ hashline: anchors.get("second"), newText: "inserted-1\ninserted-2", wholeLine: false },
-					{ hashline: anchors.get("third"), newText: "THIRD" },
-					{ hashline: anchors.get(""), newText: "tail" },
-				],
-			},
-			undefined,
-			undefined,
-			{ cwd: dir },
-		);
-		assert.match(extractText(editResult), /revisionId: rev_/);
-		assert.match(extractText(editResult), /\[changed lines /);
-		assert.match(extractText(editResult), /\d+:[a-f0-9]{8}\|THIRD/);
-
-		const finalContent = await readFile(file, "utf-8");
-		assert.equal(finalContent, "first\nsecond\ninserted-1\ninserted-2\nTHIRD\ntail");
-	} finally {
-		await rm(dir, { recursive: true, force: true });
-	}
-});
-
-test("registered tools rebase stale hashlines across consecutive edits", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-tools-hashline-rebase-"));
-	try {
-		const pi = createPiStub();
-		extension(pi as any);
-		const read = pi.tools.get("read");
-		const write = pi.tools.get("write");
-		const edit = pi.tools.get("edit");
-		assert.ok(read);
-		assert.ok(write);
-		assert.ok(edit);
-
-		const file = join(dir, "hashline-rebase.txt");
-		await write!.execute("1", { path: file, content: "first\nsecond\nthird\n" }, undefined, undefined, { cwd: dir });
-		const readResult = await read!.execute("2", { path: file, withHashlines: true }, undefined, undefined, { cwd: dir });
-		const readText = extractText(readResult);
-		const revisionId = (readResult.details as { revisionId?: string } | undefined)?.revisionId;
-		assert.ok(revisionId);
-		const secondHashline = readText.split("\n").find((line) => line.includes("|second"))?.split("|", 2)[0];
-		const thirdHashline = readText.split("\n").find((line) => line.includes("|third"))?.split("|", 2)[0];
-		assert.ok(secondHashline);
-		assert.ok(thirdHashline);
-
-		await edit!.execute(
-			"3",
-			{ path: file, baseRevisionId: revisionId, edits: [{ hashline: secondHashline, newText: "inserted-1\ninserted-2", wholeLine: false }] },
-			undefined,
-			undefined,
-			{ cwd: dir },
-		);
-		const secondEdit = await edit!.execute(
-			"4",
-			{ path: file, baseRevisionId: revisionId, edits: [{ hashline: thirdHashline, newText: "THIRD" }] },
-			undefined,
-			undefined,
-			{ cwd: dir },
-		);
-		assert.match(extractText(secondEdit), /automatic rebase/);
-		const details = secondEdit.details as { rebaseState?: string; changedRanges?: Array<{ hashlines: string[] }> } | undefined;
-		assert.equal(details?.rebaseState, "rebased");
-		assert.ok(details?.changedRanges?.some((range) => range.hashlines.some((line) => line.includes("|THIRD"))));
-
-		const finalContent = await readFile(file, "utf-8");
-		assert.equal(finalContent, "first\nsecond\ninserted-1\ninserted-2\nTHIRD\n");
+		const details = result.details as { status?: string; reason?: string; candidates?: Array<{ preview: string }> } | undefined;
+		assert.equal(details?.status, "conflict");
+		assert.equal(details?.reason, "ambiguous");
+		assert.ok(details?.candidates?.length);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
@@ -246,56 +155,6 @@ test("registered read supports explicit ranges with context", async () => {
 		assert.match(text, /\[lines 3-6 \| requested lines 4-5 \| context -1\/\+1\]/);
 		assert.match(text, /3\|line-3/);
 		assert.match(text, /6\|line-6/);
-	} finally {
-		await rm(dir, { recursive: true, force: true });
-	}
-});
-
-test("registered tools rebase stale hashlines after streaming read", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-tools-hashline-stream-rebase-"));
-	try {
-		const pi = createPiStub();
-		extension(pi as any);
-		const read = pi.tools.get("read");
-		const write = pi.tools.get("write");
-		const edit = pi.tools.get("edit");
-		assert.ok(read);
-		assert.ok(write);
-		assert.ok(edit);
-
-		const file = join(dir, "hashline-stream-rebase.txt");
-		const content = Array.from({ length: 400000 }, (_, i) => `line-${i + 1}`).join("\n") + "\n";
-		await write!.execute("1", { path: file, content }, undefined, undefined, { cwd: dir });
-		const readResult = await read!.execute(
-			"2",
-			{ path: file, offset: 1, limit: 3, withHashlines: true },
-			undefined,
-			undefined,
-			{ cwd: dir },
-		);
-		const readText = extractText(readResult);
-		const revisionId = (readResult.details as { revisionId?: string } | undefined)?.revisionId;
-		assert.ok(revisionId);
-		const thirdHashline = readText.split("\n").find((line) => line.includes("|line-3"))?.split("|", 2)[0];
-		assert.ok(thirdHashline);
-
-		await edit!.execute(
-			"3",
-			{ path: file, baseRevisionId: revisionId, edits: [{ hashline: readText.split("\n").find((line) => line.includes("|line-2"))?.split("|", 2)[0], newText: "inserted-a\ninserted-b", wholeLine: false }] },
-			undefined,
-			undefined,
-			{ cwd: dir },
-		);
-		const secondEdit = await edit!.execute(
-			"4",
-			{ path: file, baseRevisionId: revisionId, edits: [{ hashline: thirdHashline, newText: "LINE-3" }] },
-			undefined,
-			undefined,
-			{ cwd: dir },
-		);
-		assert.match(extractText(secondEdit), /automatic rebase/);
-		const finalContent = await readFile(file, "utf-8");
-		assert.match(finalContent, /^line-1\nline-2\ninserted-a\ninserted-b\nLINE-3\n/);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}

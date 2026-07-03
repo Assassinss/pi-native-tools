@@ -40,7 +40,7 @@ const grepSchema = Type.Object(
 			}),
 		),
 	},
-	{ additionalProperties: false },
+	{ additionalProperties: true },
 );
 
 type GrepMode = "content" | "count" | "filesWithMatches";
@@ -253,14 +253,15 @@ export function registerGrepTool(pi: ExtensionAPI): void {
 			"Search file contents by regex or literal pattern. Use this when you need matching lines, counts, or files with matches. Prefer find for path discovery, read for full file inspection, and bash only for shell-specific tasks. Respects .gitignore and truncates long lines in output.",
 		promptSnippet: "Search file contents without falling back to bash grep",
 		promptGuidelines: [
-			"Use grep to search file contents for symbols, strings, definitions, counts, or files with matches.",
-			"If the user already named the file or directory to search, grep it directly; do not read first unless they asked to inspect content.",
+			"Use grep only when you need to search across files for patterns, symbols, or definitions — never as a substitute for reading a file.",
+			"If the user already named a specific file, use read to inspect it. Grep is for finding which files contain a pattern.",
+			"If grep returns file paths, read those files next to get their content — don't grep them again.",
 			"Use literal=true for exact code snippets, function calls, or text containing regex metacharacters like ()[]{}?.+*.",
 			"Use mode=count for totals and mode=filesWithMatches for file-name-only results.",
 		],
 		parameters: grepSchema,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const { pattern, path: searchDir, glob, ignoreCase, literal, context, limit, mode } = params as {
+			const raw = params as {
 				pattern: string;
 				path?: string;
 				glob?: string;
@@ -269,7 +270,12 @@ export function registerGrepTool(pi: ExtensionAPI): void {
 				context?: number;
 				limit?: number;
 				mode?: GrepMode;
+				output_mode?: GrepMode;
+				outputMode?: GrepMode;
 			};
+			const { pattern, path: searchDir, glob, ignoreCase, literal, context, limit } = raw;
+			// ponytail: map common parameter name variations to mode
+			const mode = raw.mode ?? raw.output_mode ?? raw.outputMode;
 			return executeGrepNative(
 				pattern,
 				searchDir,

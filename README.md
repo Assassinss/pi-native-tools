@@ -1,10 +1,7 @@
 # pi-native-tools
 
-Pi package that replaces the built-in `bash`, `find`, `grep`, `read`, `edit`, and `write` tools.
-
-It keeps the same tool names, but swaps in:
-- native-backed `bash`, `find`, and `grep`
-- safer `read`, `edit`, and `write` behavior for hashline-based file workflows
+Pi package that replaces the built-in `bash`, `find`, `grep`, `read`, `edit`, and `write` tools with
+native-backed, simpler versions.
 
 ## Install
 
@@ -12,120 +9,70 @@ It keeps the same tool names, but swaps in:
 pi install git:github.com/Assassinss/pi-native-tools
 ```
 
-SSH form:
+## Tools
 
-```bash
-pi install git:git@github.com:Assassinss/pi-native-tools.git
+### bash
+
+Warm native shell sessions for faster repeated commands. Supports `session`, `resetSession`, and
+`timeout` controls.
+
+### find
+
+Native glob search with normalized relative paths. Only use when you don't know the file path —
+if you already have a file name, use `read` directly.
+
+### grep
+
+Native in-process search with regex, literal, context, count, and files-with-matches modes. Use
+only to search across files for patterns, symbols, or definitions — never as a substitute for
+reading a file. Accepts `output_mode` and `outputMode` as aliases for `mode`.
+
+### read
+
+Read file contents. The primary way to inspect files — when you know the file path, call `read`
+directly, don't `grep` or `find` first. Returns a `snapshotId` at the end of its output text for
+use with `edit`.
+
+Parameters: `path`, `offset` / `limit`, explicit `ranges` with optional `before`/`after` context,
+binary/NUL rejection, and large-file streaming.
+
+### edit
+
+Edit a file by replacing exact `oldText` with `newText`. Requires a prior `read` to get the
+current text and `snapshotId`.
+
+Parameters: `path`, `snapshotId` (required — from the last `read` of this file), `oldText`,
+`newText`, `replaceAll` (default `false`).
+
+Conflict responses:
+- `not_found` — oldText doesn't exist in the file
+- `ambiguous` — oldText matched multiple locations; narrow and retry
+- `stale_snapshot` — file changed since last read; re-read and retry
+
+After a successful edit, the response includes a new `snapshotId` and the message
+"Use this snapshotId for your next edit on this file — no need to re-read."
+
+### write
+
+Write content to a file with streaming support, verified writes, hashline stripping, and
+shebang executable support on Unix-like systems.
+
+## Simple Edit Flow
+
+```
+read(path, ...)          → returns text + "snapshotId: rev_xxx"
+edit(path, snapshotId=rev_xxx, oldText, newText)  → applies replacement + returns new snapshotId
 ```
 
-## Highlights
-
-- `bash` - warm native shell sessions for faster repeated commands
-- `find` - native glob search with normalized relative paths
-- `grep` - native in-process search with regex, literal, context, count, and files-with-matches modes
-- `read` - `offset` / `limit`, explicit `ranges`, optional context windows, hashline output, `details.revisionId`, binary/NUL rejection, and large-file streaming with line-snapshot fallback for later edits
-- `edit` - hashline-anchored edits, original-snapshot matching, `baseRevisionId`-based automatic rebase, `changedRanges` handoff for follow-up edits, no-op loop protection, and post-write verification
-- `write` - parent directory creation, verified writes, large-file streaming, hashline stripping, and shebang executable support on Unix-like systems
-
-## Examples
-
-Read a normal slice:
-
-```json
-{
-  "path": "src/app.ts",
-  "offset": 20,
-  "limit": 40
-}
-```
-
-Read multiple ranges with context:
-
-```json
-{
-  "path": "src/app.ts",
-  "ranges": [
-    { "start": 20, "end": 40 },
-    { "start": 120, "end": 125, "before": 2, "after": 2 }
-  ]
-}
-```
-
-Read with hashlines before an anchored edit:
-
-```json
-{
-  "path": "src/app.ts",
-  "ranges": [
-    { "start": 80, "end": 90 }
-  ],
-  "withHashlines": true
-}
-```
-
-Apply a hashline-based edit:
-
-```json
-{
-  "path": "src/app.ts",
-  "baseRevisionId": "rev_1234abcd5678",
-  "edits": [
-    {
-      "hashline": "84:a1b2c3d4",
-      "newText": "const enabled = true;"
-    }
-  ]
-}
-```
-
-Write copied hashline content safely:
-
-```json
-{
-  "path": "notes.txt",
-  "content": "[notes.txt#deadbeef]\n1:11111111|hello\n2:22222222|world"
-}
-```
-
-Written file content:
-
-```text
-hello
-world
-```
-
-## Hashline Continuation Flow
-
-1. `read(..., withHashlines=true)` returns normal hashline output plus `details.revisionId`
-2. `edit(..., baseRevisionId=...)` can safely reuse that snapshot even after nearby line shifts caused by earlier edits in the same tool session
-3. successful `edit` returns:
-   - `details.revisionId` for the new file state
-   - `details.changedRanges` with fresh `LINE:HASH|text` windows near each change
-   - matching text output so the next tool call can often skip another `read`
-4. if the file changed externally and rebase is no longer safe, `edit` fails with `needs_refresh`
-
-`changedRanges` is intentionally capped so tool output stays small enough for the model to keep using it:
-- up to 3 changed hunks
-- up to 12 hashlines per hunk
-- truncated hunks are marked in both text output and `details.changedRanges`
-
-## Notes
-
-- `read` `ranges` cannot be combined with `offset` / `limit`
-- `read` returns recovery guidance for out-of-range offsets
-- `bash` is optimized for repeated commands in the same cwd; true one-shot commands may still be slower than the old shell path
+1. `read` the file to get current text and `snapshotId`
+2. `edit` with `oldText`/`newText` and the `snapshotId` from step 1
+3. For follow-up edits on the same file, use the `snapshotId` from the edit response directly —
+   no need to re-read
+4. Only re-read when `edit` returns `stale_snapshot` or `ambiguous`
 
 ## Dev
 
 ```bash
 npm install
 npm test
-npm run bench
-npm run test:hashline-flow
 ```
-
-`npm run test:hashline-flow` prints a readable PASS/FAIL summary for:
-- changedRanges reuse without a follow-up `read`
-- automatic rebase from stale hashlines
-- large-file / streaming window fallback
-- external edits correctly returning `needs_refresh`
