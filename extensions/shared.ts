@@ -1,7 +1,7 @@
 import type { TextContent } from "@earendil-works/pi-ai";
 import { createHash } from "node:crypto";
-import { constants, createReadStream, createWriteStream } from "node:fs";
-import { access, mkdir, readFile, stat, writeFile as fsWriteFile } from "node:fs/promises";
+import { createReadStream, createWriteStream } from "node:fs";
+import { mkdir, readFile, stat, writeFile as fsWriteFile } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import {
 	DEFAULT_MAX_BYTES,
@@ -89,6 +89,10 @@ export function createRevisionId(content: string | Buffer): string {
 	return `rev_${fullHash(content).slice(0, 12)}`;
 }
 
+export function createStatRevisionId(fileStat: { size: number; mtimeMs: number; ctimeMs: number; ino?: number | bigint }): string {
+	return createRevisionId(`${fileStat.size}:${fileStat.mtimeMs}:${fileStat.ctimeMs}:${String(fileStat.ino ?? "")}`);
+}
+
 export function rememberDocumentSnapshot(absolutePath: string, content: string): string {
 	const revisionId = createRevisionId(content);
 	let history = documentHistories.get(absolutePath);
@@ -162,19 +166,6 @@ export function normalizePath(path: string, cwd: string): string {
 	return resolve(cwd, p);
 }
 
-export async function ensureReadable(path: string, absolutePath: string): Promise<void> {
-	try {
-		await access(absolutePath, constants.R_OK);
-	} catch (err: any) {
-		if (err.code === "ENOENT") {
-			throw toolError({ tool: "read", code: "file_not_found", message: `File not found: ${path}`, hint: "Check the path and retry.", details: { path } });
-		}
-		if (err.code === "EACCES") {
-			throw toolError({ tool: "read", code: "permission_denied", message: `Permission denied: ${path}`, hint: "Choose a readable path or adjust permissions.", details: { path } });
-		}
-		throw toolError({ tool: "read", code: "read_failed", message: `Cannot access file: ${path}. ${err.message}`, details: { path } });
-	}
-}
 
 export type ToolErrorPayload = {
 	tool: string;

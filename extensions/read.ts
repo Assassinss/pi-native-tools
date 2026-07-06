@@ -1,6 +1,5 @@
 import type { ExtensionAPI, ReadToolDetails } from "@earendil-works/pi-coding-agent";
 import type { TextContent } from "./shared.ts";
-import { createHash } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
 import { Type } from "typebox";
 import {
@@ -9,7 +8,7 @@ import {
 	STREAMING_THRESHOLD,
 	STREAM_READ_CHUNK_SIZE,
 	createReadStream,
-	ensureReadable,
+	createStatRevisionId,
 	formatSize,
 	normalizePath,
 	readFile,
@@ -99,10 +98,6 @@ function detectBinaryContent(buffer: Buffer, path: string): void {
 function formatReadLine(line: string, lineNumber: number, forceLineNumbers = false): string {
 	if (forceLineNumbers) return `${lineNumber}|${line}`;
 	return line;
-}
-
-function snapshotIdFromHashHex(hashHex: string): string {
-	return `rev_${hashHex.slice(0, 12)}`;
 }
 
 function buildReadResponseText(text: string, snapshotId: string): string {
@@ -292,6 +287,7 @@ export async function executeReadStreaming(
 	offset: number | undefined,
 	limit: number | undefined,
 	signal: AbortSignal | undefined,
+	snapshotId: string,
 ): Promise<{ content: TextContent[]; details: ReadDetails | undefined }> {
 	const startLine = offset ? Math.max(0, offset - 1) : 0;
 	const endLineExclusive = limit !== undefined ? startLine + limit : Number.POSITIVE_INFINITY;
@@ -304,11 +300,33 @@ export async function executeReadStreaming(
 
 		const readStream = createReadStream(absolutePath, { highWaterMark: STREAM_READ_CHUNK_SIZE });
 		const decoder = new StringDecoder("utf8");
-		const hash = createHash("sha256");
 		const selectedLines: string[] = [];
 		let sawAnyBytes = false;
 		let nextLineNumber = 1;
 		let buffer = "";
+		let resolved = false;
+
+		function finish() {
+			if (resolved) return;
+			resolved = true;
+			signal?.removeEventListener("abort", onAbort);
+			buffer += decoder.end();
+			if (buffer.length > 0) {
+				handleLine(buffer, nextLineNumber);
+				nextLineNumber++;
+			} else if (sawAnyBytes) {
+				handleLine("", nextLineNumber);
+				nextLineNumber++;
+			}
+
+			const totalLines = nextLineNumber - 1;
+			if (offset !== undefined && startLine >= totalLines) {
+				resolve(buildOffsetOutOfRangeResult(offset, totalLines, snapshotId));
+				return;
+			}
+
+			resolve(finalizeContiguousReadResult(selectedLines.join("\n"), snapshotId, startLine, totalLines, limit));
+		}
 
 		const onAbort = () => {
 			readStream.destroy();
@@ -323,7 +341,6 @@ export async function executeReadStreaming(
 		readStream.on("data", (chunk: Buffer) => {
 			try {
 				detectBinaryContent(chunk, originalPath);
-				hash.update(chunk);
 				sawAnyBytes = true;
 				buffer += decoder.write(chunk);
 				let newlineIdx: number;
@@ -333,6 +350,11 @@ export async function executeReadStreaming(
 					handleLine(line, nextLineNumber);
 					nextLineNumber++;
 				}
+				// ponytail: early-stop when we've passed requested window with a bounded limit
+				if (limit !== undefined && nextLineNumber > endLineExclusive) {
+					readStream.destroy();
+					finish();
+				}
 			} catch (err) {
 				readStream.destroy();
 				reject(err as Error);
@@ -340,24 +362,7 @@ export async function executeReadStreaming(
 		});
 
 		readStream.on("end", () => {
-			signal?.removeEventListener("abort", onAbort);
-			buffer += decoder.end();
-			if (buffer.length > 0) {
-				handleLine(buffer, nextLineNumber);
-				nextLineNumber++;
-			} else if (sawAnyBytes) {
-				handleLine("", nextLineNumber);
-				nextLineNumber++;
-			}
-
-			const totalLines = nextLineNumber - 1;
-			const snapshotId = snapshotIdFromHashHex(hash.digest("hex"));
-			if (offset !== undefined && startLine >= totalLines) {
-				resolve(buildOffsetOutOfRangeResult(offset, totalLines, snapshotId));
-				return;
-			}
-
-			resolve(finalizeContiguousReadResult(selectedLines.join("\n"), snapshotId, startLine, totalLines, limit));
+			finish();
 		});
 
 		readStream.on("error", (err) => {
@@ -372,9 +377,11 @@ async function executeReadRangesStreaming(
 	originalPath: string,
 	ranges: NormalizedReadRange[],
 	signal: AbortSignal | undefined,
+	snapshotId: string,
 ): Promise<{ content: TextContent[]; details: ReadDetails | undefined }> {
 	const mergedBlocks = mergeReadRangeBlocks(ranges);
 	const collectedBlocks = createCollectedRangeBlocks(mergedBlocks);
+	const lastRequestedEnd = mergedBlocks.length > 0 ? mergedBlocks[mergedBlocks.length - 1]!.displayEnd : 0;
 
 	return new Promise((resolve, reject) => {
 		if (signal?.aborted) {
@@ -384,11 +391,28 @@ async function executeReadRangesStreaming(
 
 		const readStream = createReadStream(absolutePath, { highWaterMark: STREAM_READ_CHUNK_SIZE });
 		const decoder = new StringDecoder("utf8");
-		const hash = createHash("sha256");
 		let sawAnyBytes = false;
 		let nextLineNumber = 1;
 		let buffer = "";
 		let currentBlockIndex = 0;
+		let resolved = false;
+
+		function finish() {
+			if (resolved) return;
+			resolved = true;
+			signal?.removeEventListener("abort", onAbort);
+			buffer += decoder.end();
+			if (buffer.length > 0) {
+				handleLine(buffer, nextLineNumber);
+				nextLineNumber++;
+			} else if (sawAnyBytes) {
+				handleLine("", nextLineNumber);
+				nextLineNumber++;
+			}
+
+			const totalLines = nextLineNumber - 1;
+			resolve(finalizeRangeReadResult(collectedBlocks, ranges, totalLines, snapshotId));
+		}
 
 		const onAbort = () => {
 			readStream.destroy();
@@ -406,7 +430,6 @@ async function executeReadRangesStreaming(
 		readStream.on("data", (chunk: Buffer) => {
 			try {
 				detectBinaryContent(chunk, originalPath);
-				hash.update(chunk);
 				sawAnyBytes = true;
 				buffer += decoder.write(chunk);
 				let newlineIdx: number;
@@ -416,6 +439,11 @@ async function executeReadRangesStreaming(
 					handleLine(line, nextLineNumber);
 					nextLineNumber++;
 				}
+				// ponytail: early-stop when collected all requested ranges
+				if (currentBlockIndex >= collectedBlocks.length && nextLineNumber > lastRequestedEnd) {
+					readStream.destroy();
+					finish();
+				}
 			} catch (err) {
 				readStream.destroy();
 				reject(err as Error);
@@ -423,19 +451,7 @@ async function executeReadRangesStreaming(
 		});
 
 		readStream.on("end", () => {
-			signal?.removeEventListener("abort", onAbort);
-			buffer += decoder.end();
-			if (buffer.length > 0) {
-				handleLine(buffer, nextLineNumber);
-				nextLineNumber++;
-			} else if (sawAnyBytes) {
-				handleLine("", nextLineNumber);
-				nextLineNumber++;
-			}
-
-			const totalLines = nextLineNumber - 1;
-			const snapshotId = snapshotIdFromHashHex(hash.digest("hex"));
-			resolve(finalizeRangeReadResult(collectedBlocks, ranges, totalLines, snapshotId));
+			finish();
 		});
 
 		readStream.on("error", (err) => {
@@ -456,13 +472,25 @@ export async function executeRead(
 	validateReadArguments(offset, limit, ranges);
 	const normalizedRanges = ranges && ranges.length > 0 ? normalizeReadRanges(ranges) : undefined;
 	const absolutePath = normalizePath(path, cwd);
-	await ensureReadable(path, absolutePath);
 	throwIfAborted(signal);
 
-	const fileStat = await stat(absolutePath);
+	let fileStat;
+	try {
+		fileStat = await stat(absolutePath);
+	} catch (err: any) {
+		throw readError(
+			err.code === "ENOENT" ? "file_not_found" : err.code === "EACCES" ? "permission_denied" : "read_failed",
+			err.code === "ENOENT" ? `File not found: ${path}` : err.code === "EACCES" ? `Permission denied: ${path}` : `Cannot access file: ${path}. ${err.message}`,
+			err.code === "ENOENT" ? "Check the path and retry." : err.code === "EACCES" ? "Choose a readable path or adjust permissions." : undefined,
+			{ path },
+		);
+	}
+	throwIfAborted(signal);
+
 	if (fileStat.size > STREAMING_THRESHOLD) {
-		if (normalizedRanges) return executeReadRangesStreaming(absolutePath, path, normalizedRanges, signal);
-		return executeReadStreaming(absolutePath, path, offset, limit, signal);
+		const snapshotId = createStatRevisionId(fileStat);
+		if (normalizedRanges) return executeReadRangesStreaming(absolutePath, path, normalizedRanges, signal, snapshotId);
+		return executeReadStreaming(absolutePath, path, offset, limit, signal, snapshotId);
 	}
 
 	const buffer = await readFile(absolutePath);

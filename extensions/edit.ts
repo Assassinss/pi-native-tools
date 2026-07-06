@@ -135,28 +135,6 @@ function buildAppliedResult(
   };
 }
 
-async function verifyEditWrite(absolutePath: string, path: string, expectedContent: string): Promise<void> {
-  let writtenContent: string;
-  try {
-    writtenContent = (await readFile(absolutePath)).toString("utf-8");
-  } catch (err: any) {
-    throw editError(
-      "verification_failed",
-      `Edit applied to ${path} but failed to re-read the file: ${err.message}`,
-      "Re-read the file and retry if the filesystem is unstable.",
-      { path },
-    );
-  }
-  if (writtenContent !== expectedContent) {
-    throw editError(
-      "verification_failed",
-      `Edit write verification failed for ${path}: disk content differs from the requested update.`,
-      "Re-read the file before retrying. Another process may have modified it.",
-      { path },
-    );
-  }
-}
-
 function invalidateScanCache(absolutePath: string): void {
   invalidateFsScanCache?.(absolutePath);
   invalidateFsScanCache?.(dirname(absolutePath));
@@ -339,7 +317,7 @@ export async function executeEdit(
         return buildConflict("not_found", `Edit made no changes to ${path}.`, currentSnapshotId);
       }
 
-      await writeAndVerify(absolutePath, path, newContent, signal);
+      await writeFile(absolutePath, path, newContent, signal);
       const newSnapshotId = rememberDocumentSnapshot(absolutePath, newContent);
       invalidateScanCache(absolutePath);
 
@@ -368,7 +346,7 @@ export async function executeEdit(
     );
     if (nextContent === content) return buildConflict("not_found", `Edit made no changes to ${path}.`, currentSnapshotId);
 
-    await writeAndVerify(absolutePath, path, nextContent, signal);
+    await writeFile(absolutePath, path, nextContent, signal);
     const newSnapshotId = rememberDocumentSnapshot(absolutePath, nextContent);
     invalidateScanCache(absolutePath);
 
@@ -377,7 +355,7 @@ export async function executeEdit(
   });
 }
 
-async function writeAndVerify(
+async function writeFile(
   absolutePath: string,
   path: string,
   content: string,
@@ -395,7 +373,6 @@ async function writeAndVerify(
     }
     throw editError("write_failed", `Failed to write ${path}: ${err.message}`, undefined, { path });
   }
-  await verifyEditWrite(absolutePath, path, content);
 }
 
 export function registerEditTool(pi: ExtensionAPI): void {
