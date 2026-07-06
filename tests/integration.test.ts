@@ -263,7 +263,7 @@ test("registered read preserves utf-8 characters split across stream chunks", as
 		const result = await read!.execute("1", { path: file, offset: 2, limit: 1 }, undefined, undefined, { cwd: dir });
 		const text = extractText(result);
 		assert.match(text, /^x你/m);
-		assert.doesNotMatch(text, / |�/);
+		assert.doesNotMatch(text, /\u0000|\uFFFD/);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
