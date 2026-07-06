@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { executeEdit } from "../extensions/edit.ts";
+import { executeEdit, registerEditTool } from "../extensions/edit.ts";
 import { executeRead } from "../extensions/read.ts";
 
 function extractText(result: { content: Array<{ type: string; text: string }> }): string {
@@ -62,6 +62,25 @@ test("executeEdit returns stale_snapshot after external change", async () => {
 	}
 });
 
+test("executeEdit rejects stale snapshot even when oldText still exists", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-stale-existing-unit-"));
+	try {
+		const file = join(dir, "demo.txt");
+		await writeFile(file, "before keep\n", "utf-8");
+		const readResult = await executeRead(file, 1, 1, undefined, dir);
+		const snapshotId = (readResult.details as { snapshotId?: string } | undefined)?.snapshotId;
+		assert.ok(snapshotId);
+		await writeFile(file, "changed before keep\n", "utf-8");
+
+		const result = await executeEdit(file, snapshotId, [{ oldText: "before", newText: "done" }], false, undefined, dir);
+		assert.equal(result.details.status, "conflict");
+		assert.equal(result.details.reason, "stale_snapshot");
+		assert.equal(await readFile(file, "utf-8"), "changed before keep\n");
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
 test("executeEdit supports replaceAll", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-all-unit-"));
 	try {
@@ -93,17 +112,17 @@ test("executeEdit applies batch edits from edits[] in one call", async () => {
 	}
 });
 
-test("executeEdit rejects overlapping batch edits", async () => {
+test("executeEdit returns conflict for overlapping batch edits", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-overlap-unit-"));
 	try {
 		const file = join(dir, "demo.txt");
 		await writeFile(file, "hello world\n", "utf-8");
-		await assert.rejects(
-			() => executeEdit(file, undefined, [
-				{ oldText: "hello world", newText: "a" },
-				{ oldText: "world", newText: "b" },
-			], false, undefined, dir),
-		);
+		const result = await executeEdit(file, undefined, [
+			{ oldText: "hello world", newText: "a" },
+			{ oldText: "world", newText: "b" },
+		], false, undefined, dir);
+		assert.equal(result.details.status, "conflict");
+		assert.equal(result.details.reason, "overlap");
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
@@ -123,4 +142,54 @@ test("executeEdit returns conflict for not_found in batch edit", async () => {
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
+});
+
+test("registerEditTool rejects mixed legacy and batch params", async () => {
+	let execute: ((
+		toolCallId: string,
+		params: unknown,
+		signal: AbortSignal | undefined,
+		onUpdate: ((update: unknown) => void) | undefined,
+		ctx: { cwd: string },
+	) => Promise<unknown>) | undefined;
+	registerEditTool({
+		registerTool(def: { execute: typeof execute }) {
+			execute = def.execute;
+		},
+	} as any);
+	assert.ok(execute);
+	await assert.rejects(
+		() => execute!("1", {
+			path: "demo.txt",
+			oldText: "a",
+			newText: "b",
+			edits: [{ oldText: "c", newText: "d" }],
+		}, undefined, undefined, { cwd: process.cwd() }),
+		/do not combine edits\[\] with oldText\/newText/,
+	);
+});
+
+
+test("registerEditTool rejects empty oldText in legacy mode", async () => {
+	let execute: ((
+		toolCallId: string,
+		params: unknown,
+		signal: AbortSignal | undefined,
+		onUpdate: ((update: unknown) => void) | undefined,
+		ctx: { cwd: string },
+	) => Promise<unknown>) | undefined;
+	registerEditTool({
+		registerTool(def: { execute: typeof execute }) {
+			execute = def.execute;
+		},
+	} as any);
+	assert.ok(execute);
+	await assert.rejects(
+		() => execute!("1", {
+			path: "demo.txt",
+			oldText: "",
+			newText: "b",
+		}, undefined, undefined, { cwd: process.cwd() }),
+		/oldText must be a non-empty string/,
+	);
 });

@@ -3,7 +3,6 @@ import { Type } from "typebox";
 import {
   dirname,
   fsWriteFile,
-  getDocumentSnapshot,
   normalizePath,
   readFile,
   rememberDocumentSnapshot,
@@ -41,7 +40,7 @@ const editSchema = Type.Object(
   {
     path: Type.String({ description: "Path to the file to edit (relative or absolute)" }),
     snapshotId: Type.Optional(
-      Type.String({ description: "Snapshot id returned by read(details.snapshotId). Optional but recommended." }),
+      Type.String({ description: "Snapshot id returned by read(details.snapshotId). Strongly recommended; without it, stale edits cannot be detected." }),
     ),
     edits: Type.Optional(
       Type.Array(replaceEditSchema, {
@@ -62,6 +61,7 @@ const editSchema = Type.Object(
 );
 
 type EditEntry = { oldText: string; newText: string };
+type ResolvedEdit = EditEntry & { index: number };
 
 function editError(code: string, message: string, hint?: string, details?: Record<string, unknown>): Error {
   return toolError({ tool: "edit", code, message, hint, details });
@@ -109,6 +109,32 @@ function buildConflict(
   };
 }
 
+function buildAppliedContent(content: string, edits: ResolvedEdit[]): string {
+  let cursor = 0;
+  let result = "";
+  for (const edit of edits) {
+    result += content.slice(cursor, edit.index) + edit.newText;
+    cursor = edit.index + edit.oldText.length;
+  }
+  return result + content.slice(cursor);
+}
+
+function buildAppliedResult(
+  path: string,
+  appliedCount: number,
+  newSnapshotId: string,
+): { content: Array<{ type: "text"; text: string }>; details: EditResultDetails } {
+  return {
+    content: [
+      {
+        type: "text",
+        text: `Applied ${appliedCount} replacement${appliedCount === 1 ? "" : "s"} to ${path}.\nsnapshotId: ${newSnapshotId}\nUse this snapshotId for your next edit on this file — no need to re-read.`,
+      },
+    ],
+    details: { status: "applied", appliedCount, newSnapshotId },
+  };
+}
+
 async function verifyEditWrite(absolutePath: string, path: string, expectedContent: string): Promise<void> {
   let writtenContent: string;
   try {
@@ -147,7 +173,7 @@ function applyBatchEdits(
   path: string,
 ): { newContent: string; appliedCount: number } | { conflict: ReturnType<typeof buildConflict> } {
   // Find position for each edit, checking uniqueness
-  const positions: Array<{ index: number; oldText: string; newText: string }> = [];
+  const positions: ResolvedEdit[] = [];
   for (const edit of edits) {
     const matches = findMatchIndices(content, edit.oldText);
     if (matches.length === 0) {
@@ -181,23 +207,16 @@ function applyBatchEdits(
     if (positions[i].index < prevEnd) {
       const a = positions[i - 1];
       const b = positions[i];
-      throw editError(
-        "overlap",
-        `Edits overlap in ${path}: "${a.oldText.slice(0, 40)}..." and "${b.oldText.slice(0, 40)}..." touch the same region. Merge them into one edit.`,
-        "Combine overlapping edits into a single oldText/newText pair.",
-        { path },
-      );
+      return {
+        conflict: buildConflict(
+          "overlap",
+          `Edits overlap in ${path}: "${a.oldText.slice(0, 40)}..." and "${b.oldText.slice(0, 40)}..." touch the same region. Merge them into one edit.`,
+        ),
+      };
     }
   }
 
-  // Apply in reverse order to preserve indices
-  let result = content;
-  for (let i = positions.length - 1; i >= 0; i--) {
-    const { index, oldText, newText } = positions[i];
-    result = result.slice(0, index) + newText + result.slice(index + oldText.length);
-  }
-
-  return { newContent: result, appliedCount: edits.length };
+  return { newContent: buildAppliedContent(content, positions), appliedCount: edits.length };
 }
 
 /** Normalize legacy oldText/newText + edits[] into a flat edits array. */
@@ -208,13 +227,43 @@ function normalizeEdits(params: {
   edits?: EditEntry[];
 }): { edits: EditEntry[]; replaceAll: boolean } {
   const result: EditEntry[] = [];
+  const hasBatchEdits = (params.edits?.length ?? 0) > 0;
+  const hasLegacyOldText = params.oldText !== undefined;
+  const hasLegacyNewText = params.newText !== undefined;
 
-  if (params.edits && params.edits.length > 0) {
-    result.push(...params.edits);
+  if (hasBatchEdits && (hasLegacyOldText || hasLegacyNewText)) {
+    throw editError(
+      "invalid_input",
+      "Edit failed: do not combine edits[] with oldText/newText.",
+      "Use either edits[] for batch edits or oldText+newText for the legacy single-edit form.",
+      {},
+    );
   }
 
-  if (params.oldText && params.newText !== undefined) {
-    result.push({ oldText: params.oldText, newText: params.newText });
+  if (hasLegacyOldText !== hasLegacyNewText) {
+    throw editError(
+      "invalid_input",
+      "Edit failed: oldText and newText must be provided together.",
+      "Pass both oldText and newText, or use edits[].",
+      {},
+    );
+  }
+
+  if (hasBatchEdits && params.replaceAll) {
+    throw editError(
+      "invalid_input",
+      "Edit failed: replaceAll can only be used with oldText/newText.",
+      "Use oldText+newText for replaceAll, or remove replaceAll when using edits[].",
+      {},
+    );
+  }
+
+  if (hasBatchEdits) {
+    result.push(...params.edits!);
+  }
+
+  if (hasLegacyOldText) {
+    result.push({ oldText: params.oldText!, newText: params.newText! });
   }
 
   if (result.length === 0) {
@@ -271,28 +320,17 @@ export async function executeEdit(
 
     const currentSnapshotId = rememberDocumentSnapshot(absolutePath, content);
     if (snapshotId && snapshotId !== currentSnapshotId) {
-      const previousSnapshot = getDocumentSnapshot(absolutePath, snapshotId);
-      if (!previousSnapshot || !edits.some((e) => previousSnapshot.includes(e.oldText))) {
-        return buildConflict(
-          "stale_snapshot",
-          `Snapshot ${snapshotId} is stale for ${path}. Re-read the file before retrying.`,
-          currentSnapshotId,
-        );
-      }
+      return buildConflict(
+        "stale_snapshot",
+        `Snapshot ${snapshotId} is stale for ${path}. Re-read the file before retrying.`,
+        currentSnapshotId,
+      );
     }
 
     // Batch mode (always use batch path; single edit is just a batch of 1)
     if (edits.length > 1 || (edits.length === 1 && !replaceAll)) {
       const batchResult = applyBatchEdits(content, edits, path);
       if ("conflict" in batchResult) {
-        // If snapshot was stale, surface that as the conflict reason
-        if (snapshotId && snapshotId !== currentSnapshotId) {
-          return buildConflict(
-            "stale_snapshot",
-            `Snapshot ${snapshotId} no longer matches ${path}. Re-read the file before retrying.`,
-            currentSnapshotId,
-          );
-        }
         return batchResult.conflict;
       }
 
@@ -305,28 +343,14 @@ export async function executeEdit(
       const newSnapshotId = rememberDocumentSnapshot(absolutePath, newContent);
       invalidateScanCache(absolutePath);
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Applied ${appliedCount} replacement${appliedCount === 1 ? "" : "s"} to ${path}.\nsnapshotId: ${newSnapshotId}\nUse this snapshotId for your next edit on this file — no need to re-read.`,
-          },
-        ],
-        details: { status: "applied", appliedCount, newSnapshotId },
-      };
+      return buildAppliedResult(path, appliedCount, newSnapshotId);
     }
 
     // Legacy replaceAll mode (single edit)
     const single = edits[0];
     const matches = findMatchIndices(content, single.oldText);
     if (matches.length === 0) {
-      return buildConflict(
-        snapshotId && snapshotId !== currentSnapshotId ? "stale_snapshot" : "not_found",
-        snapshotId && snapshotId !== currentSnapshotId
-          ? `Snapshot ${snapshotId} no longer matches ${path}. Re-read the file before retrying.`
-          : `oldText was not found in ${path}.`,
-        currentSnapshotId,
-      );
+      return buildConflict("not_found", `oldText was not found in ${path}.`, currentSnapshotId);
     }
 
     if (!replaceAll && matches.length > 1) {
@@ -338,7 +362,10 @@ export async function executeEdit(
       );
     }
 
-    const nextContent = replaceAll ? content.split(single.oldText).join(single.newText) : content.replace(single.oldText, single.newText);
+    const nextContent = buildAppliedContent(
+      content,
+      (replaceAll ? matches : [matches[0]]).map((index) => ({ index, oldText: single.oldText, newText: single.newText })),
+    );
     if (nextContent === content) return buildConflict("not_found", `Edit made no changes to ${path}.`, currentSnapshotId);
 
     await writeAndVerify(absolutePath, path, nextContent, signal);
@@ -346,15 +373,7 @@ export async function executeEdit(
     invalidateScanCache(absolutePath);
 
     const appliedCount = replaceAll ? matches.length : 1;
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Applied ${appliedCount} replacement${appliedCount === 1 ? "" : "s"} to ${path}.\nsnapshotId: ${newSnapshotId}\nUse this snapshotId for your next edit on this file — no need to re-read.`,
-        },
-      ],
-      details: { status: "applied", appliedCount, newSnapshotId },
-    };
+    return buildAppliedResult(path, appliedCount, newSnapshotId);
   });
 }
 
@@ -385,7 +404,7 @@ export function registerEditTool(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "edit",
     label: "edit",
-    description: "Edit a file by replacing exact oldText with newText, optionally against a read snapshot. Use edits[] for multiple disjoint replacements in one call.",
+    description: "Edit a file by replacing exact oldText with newText, ideally against a read snapshot so stale edits can be detected. Use edits[] for multiple disjoint replacements in one call.",
     promptSnippet: "Apply exact oldText/newText replacements with optional snapshot checks",
     promptGuidelines: [
       "You must read the file first to get the current text, then call edit with oldText/newText and the snapshotId from that read.",
