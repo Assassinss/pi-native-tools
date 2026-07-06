@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ReadToolDetails } from "@earendil-works/pi-coding-agent";
 import type { TextContent } from "./shared.ts";
 import { createHash } from "node:crypto";
+import { StringDecoder } from "node:string_decoder";
 import { Type } from "typebox";
 import {
 	DEFAULT_MAX_BYTES,
@@ -102,6 +103,42 @@ function formatReadLine(line: string, lineNumber: number, forceLineNumbers = fal
 
 function snapshotIdFromHashHex(hashHex: string): string {
 	return `rev_${hashHex.slice(0, 12)}`;
+}
+
+function buildReadResponseText(text: string, snapshotId: string): string {
+	return text.length > 0 ? `${text}\nsnapshotId: ${snapshotId}` : `snapshotId: ${snapshotId}`;
+}
+
+function buildOffsetOutOfRangeResult(offset: number, totalLines: number, snapshotId: string): { content: TextContent[]; details: ReadDetails } {
+	return {
+		content: [{ type: "text", text: `${formatOffsetOutOfRangeMessage(offset, totalLines)}\nsnapshotId: ${snapshotId}` }],
+		details: { snapshotId },
+	};
+}
+
+function finalizeContiguousReadResult(
+	outputText: string,
+	snapshotId: string,
+	startLine: number,
+	totalLines: number,
+	limit: number | undefined,
+): { content: TextContent[]; details: ReadDetails } {
+	const truncation = truncateHead(outputText);
+	let finalText = buildReadResponseText(truncation.content, snapshotId);
+	const details: ReadDetails = { snapshotId };
+
+	if (truncation.truncated) {
+		const nextOffset = startLine + truncation.outputLines + 1;
+		const truncatedBy = truncation.truncatedBy === "lines" ? `${truncation.outputLines} lines` : formatSize(truncation.outputBytes);
+		finalText += `\n\n[Showing lines ${startLine + 1}-${startLine + truncation.outputLines} of ${totalLines} (truncated at ${truncatedBy}). Use offset=${nextOffset} to continue.]`;
+		details.truncation = truncation;
+	} else if (limit !== undefined && startLine + limit < totalLines) {
+		const remaining = totalLines - (startLine + limit);
+		const nextOffset = startLine + limit + 1;
+		finalText += `\n\n[${remaining} more lines in file. Use offset=${nextOffset} to continue.]`;
+	}
+
+	return { content: [{ type: "text", text: finalText }], details };
 }
 
 function validateReadArguments(
@@ -216,16 +253,37 @@ function appendRangeFooter(text: string, notices: string[], details: ReadDetails
 	return { text: finalText, details: Object.keys(details).length > 0 ? details : undefined };
 }
 
-function buildRangeBlocksFromLines(allLines: string[], ranges: NormalizedReadRange[], totalLines: number): CollectedReadRangeBlock[] {
-	return mergeReadRangeBlocks(ranges, totalLines).map((block) => ({
+function createCollectedRangeBlocks(mergedBlocks: MergedReadRangeBlock[]): CollectedReadRangeBlock[] {
+	return mergedBlocks.map((block) => ({
 		requests: block.requests,
 		requestedDisplayStart: block.displayStart,
 		requestedDisplayEnd: block.displayEnd,
-		lines: allLines.slice(block.displayStart - 1, block.displayEnd).map((line, index) => ({
-			lineNumber: block.displayStart + index,
-			line,
-		})),
+		lines: [],
 	}));
+}
+
+function finalizeRangeReadResult(
+	blocks: CollectedReadRangeBlock[],
+	ranges: NormalizedReadRange[],
+	totalLines: number,
+	snapshotId: string,
+): { content: TextContent[]; details: ReadDetails | undefined } {
+	if (ranges.every((range) => range.start > totalLines)) return buildOffsetOutOfRangeResult(ranges[0]!.start, totalLines, snapshotId);
+	const details: ReadDetails = { snapshotId };
+	const response = appendRangeFooter(formatCollectedRangeBlocks(blocks), buildRangeNotices(ranges, totalLines), details);
+	return { content: [{ type: "text", text: buildReadResponseText(response.text, snapshotId) }], details: response.details };
+}
+
+function buildRangeBlocksFromLines(allLines: string[], ranges: NormalizedReadRange[], totalLines: number): CollectedReadRangeBlock[] {
+	const mergedBlocks = mergeReadRangeBlocks(ranges, totalLines);
+	const blocks = createCollectedRangeBlocks(mergedBlocks);
+	for (const block of blocks) {
+		block.lines = allLines.slice(block.requestedDisplayStart - 1, block.requestedDisplayEnd).map((line, index) => ({
+			lineNumber: block.requestedDisplayStart + index,
+			line,
+		}));
+	}
+	return blocks;
 }
 
 export async function executeReadStreaming(
@@ -233,7 +291,6 @@ export async function executeReadStreaming(
 	originalPath: string,
 	offset: number | undefined,
 	limit: number | undefined,
-	fileStat: { size: number },
 	signal: AbortSignal | undefined,
 ): Promise<{ content: TextContent[]; details: ReadDetails | undefined }> {
 	const startLine = offset ? Math.max(0, offset - 1) : 0;
@@ -246,6 +303,7 @@ export async function executeReadStreaming(
 		}
 
 		const readStream = createReadStream(absolutePath, { highWaterMark: STREAM_READ_CHUNK_SIZE });
+		const decoder = new StringDecoder("utf8");
 		const hash = createHash("sha256");
 		const selectedLines: string[] = [];
 		let sawAnyBytes = false;
@@ -267,7 +325,7 @@ export async function executeReadStreaming(
 				detectBinaryContent(chunk, originalPath);
 				hash.update(chunk);
 				sawAnyBytes = true;
-				buffer += chunk.toString("utf-8");
+				buffer += decoder.write(chunk);
 				let newlineIdx: number;
 				while ((newlineIdx = buffer.indexOf("\n")) !== -1) {
 					const line = buffer.slice(0, newlineIdx);
@@ -283,6 +341,7 @@ export async function executeReadStreaming(
 
 		readStream.on("end", () => {
 			signal?.removeEventListener("abort", onAbort);
+			buffer += decoder.end();
 			if (buffer.length > 0) {
 				handleLine(buffer, nextLineNumber);
 				nextLineNumber++;
@@ -293,25 +352,12 @@ export async function executeReadStreaming(
 
 			const totalLines = nextLineNumber - 1;
 			const snapshotId = snapshotIdFromHashHex(hash.digest("hex"));
-			const outputText = selectedLines.join("\n");
-			const truncation = truncateHead(outputText);
-			let finalText = truncation.content;
-			const details: ReadDetails = { snapshotId };
-
-			finalText += `\nsnapshotId: ${snapshotId}`;
-
-			if (truncation.truncated) {
-				const nextOffset = startLine + truncation.outputLines + 1;
-				const truncatedBy = truncation.truncatedBy === "lines" ? `${truncation.outputLines} lines` : formatSize(truncation.outputBytes);
-				finalText += `\n\n[Showing lines ${startLine + 1}-${startLine + truncation.outputLines} of ${totalLines} (truncated at ${truncatedBy}). Use offset=${nextOffset} to continue.]`;
-				details.truncation = truncation;
-			} else if (limit !== undefined && endLineExclusive < totalLines) {
-				const remaining = totalLines - endLineExclusive;
-				const nextOffset = endLineExclusive + 1;
-				finalText += `\n\n[${remaining} more lines in file. Use offset=${nextOffset} to continue.]`;
+			if (offset !== undefined && startLine >= totalLines) {
+				resolve(buildOffsetOutOfRangeResult(offset, totalLines, snapshotId));
+				return;
 			}
 
-			resolve({ content: [{ type: "text", text: finalText }], details });
+			resolve(finalizeContiguousReadResult(selectedLines.join("\n"), snapshotId, startLine, totalLines, limit));
 		});
 
 		readStream.on("error", (err) => {
@@ -328,12 +374,7 @@ async function executeReadRangesStreaming(
 	signal: AbortSignal | undefined,
 ): Promise<{ content: TextContent[]; details: ReadDetails | undefined }> {
 	const mergedBlocks = mergeReadRangeBlocks(ranges);
-	const collectedBlocks: CollectedReadRangeBlock[] = mergedBlocks.map((block) => ({
-		requests: block.requests,
-		requestedDisplayStart: block.displayStart,
-		requestedDisplayEnd: block.displayEnd,
-		lines: [],
-	}));
+	const collectedBlocks = createCollectedRangeBlocks(mergedBlocks);
 
 	return new Promise((resolve, reject) => {
 		if (signal?.aborted) {
@@ -342,6 +383,7 @@ async function executeReadRangesStreaming(
 		}
 
 		const readStream = createReadStream(absolutePath, { highWaterMark: STREAM_READ_CHUNK_SIZE });
+		const decoder = new StringDecoder("utf8");
 		const hash = createHash("sha256");
 		let sawAnyBytes = false;
 		let nextLineNumber = 1;
@@ -366,7 +408,7 @@ async function executeReadRangesStreaming(
 				detectBinaryContent(chunk, originalPath);
 				hash.update(chunk);
 				sawAnyBytes = true;
-				buffer += chunk.toString("utf-8");
+				buffer += decoder.write(chunk);
 				let newlineIdx: number;
 				while ((newlineIdx = buffer.indexOf("\n")) !== -1) {
 					const line = buffer.slice(0, newlineIdx);
@@ -382,6 +424,7 @@ async function executeReadRangesStreaming(
 
 		readStream.on("end", () => {
 			signal?.removeEventListener("abort", onAbort);
+			buffer += decoder.end();
 			if (buffer.length > 0) {
 				handleLine(buffer, nextLineNumber);
 				nextLineNumber++;
@@ -391,21 +434,8 @@ async function executeReadRangesStreaming(
 			}
 
 			const totalLines = nextLineNumber - 1;
-			if (ranges.every((range) => range.start > totalLines)) {
-				const snapshotId = snapshotIdFromHashHex(hash.digest("hex"));
-				resolve({
-					content: [{ type: "text", text: `${formatOffsetOutOfRangeMessage(ranges[0]!.start, totalLines)}\nsnapshotId: ${snapshotId}` }],
-					details: { snapshotId },
-				});
-				return;
-			}
-
 			const snapshotId = snapshotIdFromHashHex(hash.digest("hex"));
-			const body = formatCollectedRangeBlocks(collectedBlocks);
-			const details: ReadDetails = { snapshotId };
-			const response = appendRangeFooter(body, buildRangeNotices(ranges, totalLines), details);
-			response.text += `\nsnapshotId: ${snapshotId}`;
-			resolve({ content: [{ type: "text", text: response.text }], details: response.details });
+			resolve(finalizeRangeReadResult(collectedBlocks, ranges, totalLines, snapshotId));
 		});
 
 		readStream.on("error", (err) => {
@@ -432,7 +462,7 @@ export async function executeRead(
 	const fileStat = await stat(absolutePath);
 	if (fileStat.size > STREAMING_THRESHOLD) {
 		if (normalizedRanges) return executeReadRangesStreaming(absolutePath, path, normalizedRanges, signal);
-		return executeReadStreaming(absolutePath, path, offset, limit, fileStat, signal);
+		return executeReadStreaming(absolutePath, path, offset, limit, signal);
 	}
 
 	const buffer = await readFile(absolutePath);
@@ -445,49 +475,13 @@ export async function executeRead(
 	const allLines = endsWithNewline ? fileLines.concat("") : fileLines;
 	const totalFileLines = allLines.length;
 
-	if (normalizedRanges) {
-		if (normalizedRanges.every((range) => range.start > totalFileLines)) {
-			return {
-				content: [{ type: "text", text: `${formatOffsetOutOfRangeMessage(normalizedRanges[0]!.start, totalFileLines)}\nsnapshotId: ${snapshotId}` }],
-				details: { snapshotId },
-			};
-		}
-		const blocks = buildRangeBlocksFromLines(allLines, normalizedRanges, totalFileLines);
-		const body = formatCollectedRangeBlocks(blocks);
-		const details: ReadDetails = { snapshotId };
-		const response = appendRangeFooter(body, buildRangeNotices(normalizedRanges, totalFileLines), details);
-		response.text += `\nsnapshotId: ${snapshotId}`;
-		return { content: [{ type: "text", text: response.text }], details: response.details };
-	}
+	if (normalizedRanges) return finalizeRangeReadResult(buildRangeBlocksFromLines(allLines, normalizedRanges, totalFileLines), normalizedRanges, totalFileLines, snapshotId);
 
 	const startLine = offset ? Math.max(0, offset - 1) : 0;
-	if (offset !== undefined && startLine >= allLines.length) {
-		return {
-			content: [{ type: "text", text: `${formatOffsetOutOfRangeMessage(offset, allLines.length)}\nsnapshotId: ${snapshotId}` }],
-			details: { snapshotId },
-		};
-	}
+	if (offset !== undefined && startLine >= allLines.length) return buildOffsetOutOfRangeResult(offset, allLines.length, snapshotId);
 
 	const selectedLines = limit !== undefined ? allLines.slice(startLine, startLine + limit) : allLines.slice(startLine);
-	const outputText = selectedLines.join("\n");
-	const truncation = truncateHead(outputText);
-	let finalText = truncation.content;
-	const details: ReadDetails = { snapshotId };
-
-	finalText += `\nsnapshotId: ${snapshotId}`;
-
-	if (truncation.truncated) {
-		const nextOffset = startLine + truncation.outputLines + 1;
-		const truncatedBy = truncation.truncatedBy === "lines" ? `${truncation.outputLines} lines` : formatSize(truncation.outputBytes);
-		finalText += `\n\n[Showing lines ${startLine + 1}-${startLine + truncation.outputLines} of ${totalFileLines} (truncated at ${truncatedBy}). Use offset=${nextOffset} to continue.]`;
-		details.truncation = truncation;
-	} else if (limit !== undefined && startLine + limit < allLines.length) {
-		const remaining = allLines.length - (startLine + limit);
-		const nextOffset = startLine + limit + 1;
-		finalText += `\n\n[${remaining} more lines in file. Use offset=${nextOffset} to continue.]`;
-	}
-
-	return { content: [{ type: "text", text: finalText }], details: Object.keys(details).length > 0 ? details : undefined };
+	return finalizeContiguousReadResult(selectedLines.join("\n"), snapshotId, startLine, totalFileLines, limit);
 }
 
 export function registerReadTool(pi: ExtensionAPI): void {
