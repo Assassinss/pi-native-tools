@@ -12,7 +12,7 @@ import {
 } from "./shared.ts";
 import { invalidateFsScanCache } from "./omp-native.ts";
 
-type EditConflictReason = "not_found" | "ambiguous" | "stale_snapshot" | "overlap";
+type EditConflictReason = "not_found" | "ambiguous" | "stale_snapshot" | "overlap" | "no_change";
 
 type EditResultDetails =
   | {
@@ -27,6 +27,11 @@ type EditResultDetails =
       candidates?: Array<{ preview: string }>;
       latestSnapshotId?: string;
     };
+
+type EditConflictResult = {
+  content: Array<{ type: "text"; text: string }>;
+  details: EditResultDetails;
+};
 
 const replaceEditSchema = Type.Object(
   {
@@ -60,7 +65,7 @@ const editSchema = Type.Object(
   { additionalProperties: false },
 );
 
-type EditEntry = { oldText: string; newText: string };
+type EditEntry = Type.Static<typeof replaceEditSchema>;
 type ResolvedEdit = EditEntry & { index: number };
 
 function editError(code: string, message: string, hint?: string, details?: Record<string, unknown>): Error {
@@ -95,7 +100,7 @@ function buildConflict(
   message: string,
   latestSnapshotId?: string,
   candidates?: Array<{ preview: string }>,
-): { content: Array<{ type: "text"; text: string }>; details: EditResultDetails } {
+): EditConflictResult {
   const extras = [message, latestSnapshotId ? `latestSnapshotId: ${latestSnapshotId}` : "", candidates?.length ? `candidates: ${candidates.length}` : ""].filter(Boolean).join("; ");
   return {
     content: [{ type: "text", text: `Conflict: ${reason}. ${extras}` }],
@@ -110,13 +115,14 @@ function buildConflict(
 }
 
 function buildAppliedContent(content: string, edits: ResolvedEdit[]): string {
+  const parts: string[] = [];
   let cursor = 0;
-  let result = "";
   for (const edit of edits) {
-    result += content.slice(cursor, edit.index) + edit.newText;
+    parts.push(content.slice(cursor, edit.index), edit.newText);
     cursor = edit.index + edit.oldText.length;
   }
-  return result + content.slice(cursor);
+  parts.push(content.slice(cursor));
+  return parts.join("");
 }
 
 function buildAppliedResult(
@@ -136,21 +142,38 @@ function buildAppliedResult(
 }
 
 function invalidateScanCache(absolutePath: string): void {
-  invalidateFsScanCache?.(absolutePath);
-  invalidateFsScanCache?.(dirname(absolutePath));
+  invalidateFsScanCache(absolutePath);
+  invalidateFsScanCache(dirname(absolutePath));
 }
 
 /**
- * Apply batch edits against original content.
- * Each oldText must match exactly once and not overlap with other edits.
+ * Apply edits against original content.
+ * When allowMultiple is false, each oldText must match exactly once and not overlap with other edits.
+ * When allowMultiple is true, only one edit is expected; every occurrence is replaced.
  * Returns conflict result object directly (instead of throwing) so caller can handle it.
  */
-function applyBatchEdits(
+function applyEdits(
   content: string,
   edits: EditEntry[],
   path: string,
-): { newContent: string; appliedCount: number } | { conflict: ReturnType<typeof buildConflict> } {
-  // Find position for each edit, checking uniqueness
+  allowMultiple: boolean,
+): { newContent: string; appliedCount: number } | { conflict: EditConflictResult } {
+  if (allowMultiple) {
+    // ReplaceAll mode: single edit, replace every occurrence
+    const single = edits[0];
+    const matches = findMatchIndices(content, single.oldText);
+    if (matches.length === 0) {
+      return { conflict: buildConflict("not_found", `oldText was not found in ${path}.`) };
+    }
+    const positions: ResolvedEdit[] = matches.map((index) => ({
+      index,
+      oldText: single.oldText,
+      newText: single.newText,
+    }));
+    return { newContent: buildAppliedContent(content, positions), appliedCount: matches.length };
+  }
+
+  // Batch mode: each edit must match exactly once and not overlap
   const positions: ResolvedEdit[] = [];
   for (const edit of edits) {
     const matches = findMatchIndices(content, edit.oldText);
@@ -235,13 +258,12 @@ function normalizeEdits(params: {
       {},
     );
   }
-
-  if (hasBatchEdits) {
-    result.push(...params.edits!);
+  if (params.edits) {
+    result.push(...params.edits);
   }
 
-  if (hasLegacyOldText) {
-    result.push({ oldText: params.oldText!, newText: params.newText! });
+  if (params.oldText !== undefined && params.newText !== undefined) {
+    result.push({ oldText: params.oldText, newText: params.newText });
   }
 
   if (result.length === 0) {
@@ -278,23 +300,20 @@ export async function executeEdit(
   const absolutePath = normalizePath(path, cwd);
 
   return withFileMutationQueue(absolutePath, async () => {
-    throwIfAborted(signal);
-
     let content: string;
     try {
       content = (await readFile(absolutePath)).toString("utf-8");
-    } catch (err: any) {
+    } catch (err: unknown) {
       throwIfAborted(signal);
-      if (err.code === "ENOENT") {
+      const nodeErr = err as { code?: string; message?: string };
+      if (nodeErr.code === "ENOENT") {
         throw editError("file_not_found", `File not found: ${path}. Use write to create new files.`, "Create the file with write or check the path.", { path });
       }
-      if (err.code === "EACCES") {
+      if (nodeErr.code === "EACCES") {
         throw editError("permission_denied", `Permission denied: ${path}`, "Choose a writable path or adjust permissions.", { path });
       }
-      throw editError("read_failed", `Cannot access file: ${path}. Error: ${err.message}`, undefined, { path });
+      throw editError("read_failed", `Cannot access file: ${path}. Error: ${nodeErr.message}`, undefined, { path });
     }
-
-    throwIfAborted(signal);
 
     const currentSnapshotId = rememberDocumentSnapshot(absolutePath, content);
     if (snapshotId && snapshotId !== currentSnapshotId) {
@@ -305,52 +324,21 @@ export async function executeEdit(
       );
     }
 
-    // Batch mode (always use batch path; single edit is just a batch of 1)
-    if (edits.length > 1 || (edits.length === 1 && !replaceAll)) {
-      const batchResult = applyBatchEdits(content, edits, path);
-      if ("conflict" in batchResult) {
-        return batchResult.conflict;
-      }
-
-      const { newContent, appliedCount } = batchResult;
-      if (newContent === content) {
-        return buildConflict("not_found", `Edit made no changes to ${path}.`, currentSnapshotId);
-      }
-
-      await writeFile(absolutePath, path, newContent, signal);
-      const newSnapshotId = rememberDocumentSnapshot(absolutePath, newContent);
-      invalidateScanCache(absolutePath);
-
-      return buildAppliedResult(path, appliedCount, newSnapshotId);
+    // Single unified path: applyEdits handles both batch and replaceAll modes
+    const result = applyEdits(content, edits, path, replaceAll);
+    if ("conflict" in result) {
+      return result.conflict;
     }
 
-    // Legacy replaceAll mode (single edit)
-    const single = edits[0];
-    const matches = findMatchIndices(content, single.oldText);
-    if (matches.length === 0) {
-      return buildConflict("not_found", `oldText was not found in ${path}.`, currentSnapshotId);
+    const { newContent, appliedCount } = result;
+    if (newContent === content) {
+      return buildConflict("no_change", `Edit made no changes to ${path}.`, currentSnapshotId);
     }
 
-    if (!replaceAll && matches.length > 1) {
-      return buildConflict(
-        "ambiguous",
-        `oldText matched ${matches.length} locations in ${path}. Narrow the text and retry.`,
-        currentSnapshotId,
-        matches.slice(0, 3).map((index) => ({ preview: buildPreview(content, index, single.oldText) })),
-      );
-    }
-
-    const nextContent = buildAppliedContent(
-      content,
-      (replaceAll ? matches : [matches[0]]).map((index) => ({ index, oldText: single.oldText, newText: single.newText })),
-    );
-    if (nextContent === content) return buildConflict("not_found", `Edit made no changes to ${path}.`, currentSnapshotId);
-
-    await writeFile(absolutePath, path, nextContent, signal);
-    const newSnapshotId = rememberDocumentSnapshot(absolutePath, nextContent);
+    await writeFile(absolutePath, path, newContent, signal);
+    const newSnapshotId = rememberDocumentSnapshot(absolutePath, newContent);
     invalidateScanCache(absolutePath);
 
-    const appliedCount = replaceAll ? matches.length : 1;
     return buildAppliedResult(path, appliedCount, newSnapshotId);
   });
 }
@@ -363,15 +351,16 @@ async function writeFile(
 ): Promise<void> {
   try {
     await fsWriteFile(absolutePath, content, "utf-8");
-  } catch (err: any) {
+  } catch (err: unknown) {
     throwIfAborted(signal);
-    if (err.code === "EACCES") {
+    const nodeErr = err as { code?: string; message?: string };
+    if (nodeErr.code === "EACCES") {
       throw editError("permission_denied_write", `Permission denied writing: ${path}`, "Choose a writable path or adjust permissions.", { path });
     }
-    if (err.code === "ENOSPC") {
+    if (nodeErr.code === "ENOSPC") {
       throw editError("disk_full", `Disk full: cannot write to ${path}`, "Free disk space and retry the edit.", { path });
     }
-    throw editError("write_failed", `Failed to write ${path}: ${err.message}`, undefined, { path });
+    throw editError("write_failed", `Failed to write ${path}: ${nodeErr.message}`, undefined, { path });
   }
 }
 
