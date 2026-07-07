@@ -15,7 +15,7 @@ test("executeEdit applies exact replacement with snapshotId", async () => {
 	try {
 		const file = join(dir, "demo.txt");
 		await writeFile(file, "alpha beta gamma\n", "utf-8");
-		const readResult = await executeRead(file, 1, 1, undefined, dir);
+		const readResult = await executeRead(file, 1, 1, undefined, dir, undefined, undefined, true);
 		const snapshotId = (readResult.details as { snapshotId?: string } | undefined)?.snapshotId;
 		assert.ok(snapshotId);
 
@@ -48,7 +48,7 @@ test("executeEdit returns stale_snapshot after external change", async () => {
 	try {
 		const file = join(dir, "demo.txt");
 		await writeFile(file, "before\n", "utf-8");
-		const readResult = await executeRead(file, 1, 1, undefined, dir);
+		const readResult = await executeRead(file, 1, 1, undefined, dir, undefined, undefined, true);
 		const snapshotId = (readResult.details as { snapshotId?: string } | undefined)?.snapshotId;
 		assert.ok(snapshotId);
 		await writeFile(file, "after\n", "utf-8");
@@ -67,7 +67,7 @@ test("executeEdit rejects stale snapshot even when oldText still exists", async 
 	try {
 		const file = join(dir, "demo.txt");
 		await writeFile(file, "before keep\n", "utf-8");
-		const readResult = await executeRead(file, 1, 1, undefined, dir);
+		const readResult = await executeRead(file, 1, 1, undefined, dir, undefined, undefined, true);
 		const snapshotId = (readResult.details as { snapshotId?: string } | undefined)?.snapshotId;
 		assert.ok(snapshotId);
 		await writeFile(file, "changed before keep\n", "utf-8");

@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ReadToolDetails } from "@earendil-works/pi-coding-agent";
 import type { TextContent } from "./shared.ts";
 import { StringDecoder } from "node:string_decoder";
+import { basename, extname } from "node:path";
 import { Type } from "typebox";
 import {
 	DEFAULT_MAX_BYTES,
@@ -10,6 +11,9 @@ import {
 	createReadStream,
 	createStatRevisionId,
 	formatSize,
+	getCurrentDocumentRevision,
+	getDocumentMtime,
+	getDocumentSnapshot,
 	normalizePath,
 	readFile,
 	rememberDocumentSnapshot,
@@ -56,6 +60,61 @@ type CollectedReadRangeBlock = {
 
 type ReadDetails = ReadToolDetails & { snapshotId?: string };
 
+type OutlineEntry = { lineNumber: number; line: string };
+
+// ponytail: regex-based outline patterns, upgrade to tree-sitter if precision matters
+const OUTLINE_PATTERNS: Record<string, RegExp[]> = {
+	ts: [/^\s*(?:export\s+)?(?:async\s+)?(?:function|class|interface|type|enum)\s/, /^\s*import\s/],
+	tsx: [/^\s*(?:export\s+)?(?:async\s+)?(?:function|class|interface|type|enum)\s/, /^\s*import\s/],
+	js: [/^\s*(?:export\s+)?(?:async\s+)?(?:function|class)\s/, /^\s*import\s/],
+	jsx: [/^\s*(?:export\s+)?(?:async\s+)?(?:function|class)\s/, /^\s*import\s/],
+	mjs: [/^\s*(?:export\s+)?(?:async\s+)?(?:function|class)\s/, /^\s*import\s/],
+	cjs: [/^\s*(?:export\s+)?(?:async\s+)?(?:function|class)\s/, /^\s*import\s/],
+	py: [/^\s*(?:async\s+)?def\s/, /^\s*class\s/, /^\s*@\w/, /^\s*(?:from\s+\S+\s+)?import\s/],
+	pyi: [/^\s*(?:async\s+)?def\s/, /^\s*class\s/, /^\s*@\w/, /^\s*(?:from\s+\S+\s+)?import\s/],
+	pyx: [/^\s*(?:async\s+)?def\s/, /^\s*class\s/, /^\s*@\w/, /^\s*(?:from\s+\S+\s+)?import\s/],
+	rs: [/^\s*(?:pub\s+)?(?:async\s+)?fn\s/, /^\s*(?:pub\s+)?struct\s/, /^\s*(?:pub\s+)?enum\s/, /^\s*(?:pub\s+)?trait\s/, /^\s*(?:pub\s+)?impl\b/, /^\s*(?:pub\s+)?mod\s/, /^\s*use\s/, /^\s*macro_rules!/],
+	go: [/^\s*func\s/, /^\s*type\s/, /^\s*var\s/, /^\s*const\s/, /^\s*import\b/],
+	java: [/^\s*(?:public|private|protected)?\s*(?:static\s+)?(?:abstract\s+)?(?:class|interface|enum|@interface)\s/],
+	c: [/^\s*#(?:include|define|ifdef|ifndef|pragma)/, /^\s*(?:struct|enum)\s/],
+	cpp: [/^\s*#(?:include|define|ifdef|ifndef|pragma)/, /^\s*(?:struct|class|enum)\s/],
+	h: [/^\s*#(?:include|define|ifdef|ifndef|pragma)/, /^\s*(?:struct|class|enum)\s/],
+	hpp: [/^\s*#(?:include|define|ifdef|ifndef|pragma)/, /^\s*(?:struct|class|enum)\s/],
+	cc: [/^\s*#(?:include|define|ifdef|ifndef|pragma)/, /^\s*(?:struct|class|enum)\s/],
+	cxx: [/^\s*#(?:include|define|ifdef|ifndef|pragma)/, /^\s*(?:struct|class|enum)\s/],
+	md: [/^#{1,6}\s/],
+	json: [/^\S/],
+	yaml: [/^\S/],
+	yml: [/^\S/],
+};
+
+const GENERIC_OUTLINE_PATTERN = /^\S/;
+
+function getOutlinePatterns(filePath: string): RegExp[] {
+	const ext = extname(filePath).slice(1).toLowerCase();
+	return OUTLINE_PATTERNS[ext] ?? [GENERIC_OUTLINE_PATTERN];
+}
+
+function buildOutline(allLines: string[], filePath: string): OutlineEntry[] {
+	const patterns = getOutlinePatterns(filePath);
+	const entries: OutlineEntry[] = [];
+	for (let i = 0; i < allLines.length; i++) {
+		const line = allLines[i]!;
+		if (line.length === 0) continue;
+		if (patterns.some((p) => p.test(line))) {
+			entries.push({ lineNumber: i + 1, line: line.trim() });
+		}
+	}
+	return entries;
+}
+
+function formatOutline(entries: OutlineEntry[], filePath: string): string {
+	const name = basename(filePath);
+	const header = `[outline for ${name} — ${entries.length} declaration${entries.length === 1 ? "" : "s"}]`;
+	if (entries.length === 0) return header;
+	return `${header}\n${entries.map((e) => `${e.lineNumber}: ${e.line}`).join("\n")}`;
+}
+
 const readRangeSchema = Type.Object({
 	start: Type.Integer({ minimum: 1, description: "First line in the requested range (1-indexed)." }),
 	end: Type.Optional(Type.Integer({ minimum: 1, description: "Last line in the requested range (inclusive). Defaults to start." })),
@@ -74,6 +133,8 @@ const readSchema = Type.Object({
 				"Explicit line ranges to read. Each range can include before/after context, e.g. { start: 20, end: 40, before: 2, after: 2 }. Mutually exclusive with offset/limit.",
 		}),
 	),
+	outline: Type.Optional(Type.Boolean({ description: "Return only a structural outline (function/class declarations with line numbers). Combine with ranges to also read target sections in one call." })),
+	force: Type.Optional(Type.Boolean({ description: "Internal escape hatch." })),
 });
 
 function readError(code: string, message: string, hint?: string, details?: Record<string, unknown>): Error {
@@ -140,7 +201,9 @@ function validateReadArguments(
 	offset: number | undefined,
 	limit: number | undefined,
 	ranges: ReadRangeRequest[] | undefined,
+	outline: boolean | undefined,
 ): void {
+	if (outline) return;
 	if (!ranges || ranges.length === 0) return;
 	if (offset !== undefined || limit !== undefined) {
 		throw readError(
@@ -468,8 +531,10 @@ export async function executeRead(
 	signal: AbortSignal | undefined,
 	cwd: string,
 	ranges?: ReadRangeRequest[],
+	outline?: boolean,
+	force?: boolean,
 ): Promise<{ content: TextContent[]; details: ReadDetails | undefined }> {
-	validateReadArguments(offset, limit, ranges);
+	validateReadArguments(offset, limit, ranges, outline);
 	const normalizedRanges = ranges && ranges.length > 0 ? normalizeReadRanges(ranges) : undefined;
 	const absolutePath = normalizePath(path, cwd);
 	throwIfAborted(signal);
@@ -487,6 +552,34 @@ export async function executeRead(
 	}
 	throwIfAborted(signal);
 
+	// ponytail: dedup unchanged re-reads; outline-only is exempt, outline+ranges dedups the ranges part
+	if (!force) {
+		const prevMtime = getDocumentMtime(absolutePath);
+		if (prevMtime !== undefined && prevMtime === fileStat.mtimeMs) {
+			const prevRev = getCurrentDocumentRevision(absolutePath)!;
+			if (outline && !normalizedRanges) {
+				// outline-only is never deduped
+			} else if (outline && normalizedRanges) {
+				const cached = getDocumentSnapshot(absolutePath, prevRev);
+				if (cached !== undefined) {
+					const { lines: cachedLines, endsWithNewline: cachedEndsNewline } = splitContentLines(cached);
+					const cachedAllLines = cachedEndsNewline ? cachedLines.concat("") : cachedLines;
+					const outlineText = formatOutline(buildOutline(cachedAllLines, path), path);
+					const dedupMsg = `Ranges content unchanged since your last read (snapshotId: ${prevRev}). Content is already in your context. Use force=true only if you need to re-read.`;
+					return {
+						content: [{ type: "text", text: `${outlineText}\n\n---\n${dedupMsg}` }],
+						details: { snapshotId: prevRev },
+					};
+				}
+			} else {
+				return {
+					content: [{ type: "text", text: `Content unchanged since your last read (snapshotId: ${prevRev}). Content is already in your context. Use force=true only if you need to re-read.` }],
+					details: { snapshotId: prevRev },
+				};
+			}
+		}
+	}
+
 	if (fileStat.size > STREAMING_THRESHOLD) {
 		const snapshotId = createStatRevisionId(fileStat);
 		if (normalizedRanges) return executeReadRangesStreaming(absolutePath, path, normalizedRanges, signal, snapshotId);
@@ -497,11 +590,37 @@ export async function executeRead(
 	throwIfAborted(signal);
 	detectBinaryContent(buffer, path);
 	const rawContent = buffer.toString("utf-8");
-	const snapshotId = rememberDocumentSnapshot(absolutePath, rawContent);
-
 	const { lines: fileLines, endsWithNewline } = splitContentLines(rawContent);
 	const allLines = endsWithNewline ? fileLines.concat("") : fileLines;
 	const totalFileLines = allLines.length;
+
+	// ponytail: seed mtime only when the read returns the full file content,
+	// so partial reads (offset/limit/ranges that don't cover everything, outline-only)
+	// don't block subsequent reads of other sections.
+	const contentLineCount = fileLines.length; // excludes trailing empty line from final newline
+	const seedsMtime = (() => {
+		if (outline && !normalizedRanges) return false;
+		if (normalizedRanges) {
+			const merged = mergeReadRangeBlocks(normalizedRanges, totalFileLines);
+			if (merged.length !== 1) return false;
+			return merged[0]!.displayStart <= 1 && merged[0]!.displayEnd >= contentLineCount;
+		}
+		const startLine = offset ? Math.max(0, offset - 1) : 0;
+		if (startLine !== 0) return false;
+		if (limit !== undefined && limit < contentLineCount) return false;
+		return true;
+	})();
+	const snapshotId = rememberDocumentSnapshot(absolutePath, rawContent, seedsMtime ? fileStat.mtimeMs : undefined);
+
+	if (outline) {
+		const outlineText = formatOutline(buildOutline(allLines, path), path);
+		if (!normalizedRanges) {
+			return { content: [{ type: "text", text: buildReadResponseText(outlineText, snapshotId) }], details: { snapshotId } };
+		}
+		const rangeResult = finalizeRangeReadResult(buildRangeBlocksFromLines(allLines, normalizedRanges, totalFileLines), normalizedRanges, totalFileLines, snapshotId);
+		const combined = `${outlineText}\n\n---\n${rangeResult.content[0]!.text}`;
+		return { content: [{ type: "text", text: combined }], details: rangeResult.details };
+	}
 
 	if (normalizedRanges) return finalizeRangeReadResult(buildRangeBlocksFromLines(allLines, normalizedRanges, totalFileLines), normalizedRanges, totalFileLines, snapshotId);
 
@@ -520,21 +639,21 @@ export function registerReadTool(pi: ExtensionAPI): void {
 		promptSnippet: "Read file contents",
 		promptGuidelines: [
 			"Read is the primary way to inspect file contents. When the user names a file or you need its text, read it directly — don't grep or find first.",
-			"Every read returns a snapshotId at the end of its output. Always copy this snapshotId to your next edit on the same file.",
-			"After editing a file, the edit result includes a new snapshotId — use it directly for follow-up edits. No need to re-read the file.",
-			"Don't read the same file twice in one tool call batch. One read per file, then edit with the snapshotId from that read.",
-			"Only re-read a file when edit returns stale_snapshot or ambiguous. Never re-read just to confirm the edit result is correct.",
-			"Use ranges for disjoint line windows or when you need before/after context around specific lines.",
+			"Every read returns a snapshotId — copy it to your next edit. After editing, the result gives a new snapshotId; use that directly, no re-read needed.",
+			"Use ranges for specific line windows, outline=true to discover file structure (declarations + line numbers). Combine both in one call for structure + content.",
+			"The tool blocks unchanged re-reads automatically. Only re-read when edit returns stale_snapshot or ambiguous.",
 		],
 		parameters: readSchema,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			const { path, offset, limit, ranges } = params as {
+			const { path, offset, limit, ranges, outline, force } = params as {
 				path: string;
 				offset?: number;
 				limit?: number;
 				ranges?: ReadRangeRequest[];
+				outline?: boolean;
+				force?: boolean;
 			};
-			return executeRead(path, offset, limit, signal, ctx?.cwd ?? process.cwd(), ranges);
+			return executeRead(path, offset, limit, signal, ctx?.cwd ?? process.cwd(), ranges, outline, force);
 		},
 	});
 }
