@@ -34,7 +34,22 @@ directly, don't `grep` or `find` first. Returns a `snapshotId` at the end of its
 use with `edit`.
 
 Parameters: `path`, `offset` / `limit`, explicit `ranges` with optional `before`/`after` context,
-binary/NUL rejection, and large-file streaming.
+`outline`, `force`, binary/NUL rejection, and large-file streaming.
+
+**`outline`** — returns a structural outline (function/class/type declarations with line numbers)
+instead of full content. Supports TS/JS/Python/Rust/Go/Java/C/C++/Markdown/JSON/YAML via regex
+patterns; other files fall back to top-level non-empty lines. Combine `outline` with `ranges` to
+get structure + target content in one call.
+
+**Dedup** — unchanged re-reads are blocked automatically. When the file's mtime hasn't changed
+since the last full read, `read` returns a short `Content unchanged ... Content is already in your
+context.` message instead of re-sending content. Only full-file reads seed the dedup cache;
+partial reads (`offset`/`limit`/partial `ranges`/`outline`-only) don't block subsequent reads of
+other sections.
+
+**`force`** — escape hatch to bypass dedup. Not mentioned in prompt guidelines or schema
+description so agents don't preemptively bypass dedup; the dedup message itself tells the agent
+when to use it.
 
 ### edit
 
@@ -69,6 +84,8 @@ edit(path, snapshotId=rev_xxx, oldText, newText)  → applies replacement + retu
 3. For follow-up edits on the same file, use the `snapshotId` from the edit response directly —
    no need to re-read
 4. Only re-read when `edit` returns `stale_snapshot` or `ambiguous`
+5. To discover a file's structure before reading specific sections, use `outline=true` (optionally
+   combined with `ranges` for structure + content in one call)
 
 ## Dev
 
