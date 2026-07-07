@@ -161,6 +161,9 @@ function applyEdits(
   if (allowMultiple) {
     // ReplaceAll mode: single edit, replace every occurrence
     const single = edits[0];
+    if (single.oldText === single.newText) {
+      return { conflict: buildConflict("no_change", `Edit made no changes to ${path}.`) };
+    }
     const matches = findMatchIndices(content, single.oldText);
     if (matches.length === 0) {
       return { conflict: buildConflict("not_found", `oldText was not found in ${path}.`) };
@@ -174,6 +177,9 @@ function applyEdits(
   }
 
   // Batch mode: each edit must match exactly once and not overlap
+  if (edits.every((e) => e.oldText === e.newText)) {
+    return { conflict: buildConflict("no_change", `Edit made no changes to ${path}.`) };
+  }
   const positions: ResolvedEdit[] = [];
   for (const edit of edits) {
     const matches = findMatchIndices(content, edit.oldText);
@@ -189,10 +195,11 @@ function applyEdits(
       const candidates = matches.slice(0, 3).map((index) => ({
         preview: buildPreview(content, index, edit.oldText),
       }));
+      const candidatePreviews = candidates.map((c) => c.preview).join(", ");
       return {
         conflict: buildConflict(
           "ambiguous",
-          `oldText matched ${matches.length} locations in ${path}. Narrow the text and retry.`,
+          `oldText matched ${matches.length} locations in ${path}: [${candidatePreviews}]. Narrow the text and retry.`,
           undefined,
           candidates,
         ),
