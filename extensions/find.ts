@@ -108,8 +108,8 @@ export function registerFindTool(pi: ExtensionAPI): void {
 	pi.registerTool({
 		...builtInFind,
 		description:
-			"Find file and directory paths by glob pattern. Only use this when you don't know the file path — if you already have a file name, use read directly. Respects .gitignore and returns workspace-relative paths.",
-		promptSnippet: "Find file paths by glob before reading or searching file contents",
+			"Find file and directory paths by glob pattern. Returns up to 1000 workspace-relative paths. Only use this when you don't know the file path — if you already have a file name, use read directly. Respects .gitignore.",
+		promptSnippet: "Find file paths by glob pattern",
 		promptGuidelines: [
 			"Use find only to discover candidate file or directory paths by name or location.",
 			"If the user already gave the path, do not use find; read it, grep it, or edit it directly.",

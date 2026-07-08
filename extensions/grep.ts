@@ -40,7 +40,7 @@ const grepSchema = Type.Object(
 			}),
 		),
 	},
-	{ additionalProperties: true },
+	{ additionalProperties: false },
 );
 
 type GrepMode = "content" | "count" | "filesWithMatches";
@@ -251,7 +251,7 @@ export function registerGrepTool(pi: ExtensionAPI): void {
 		...builtInGrep,
 		description:
 			"Search file contents by regex or literal pattern. Use this when you need matching lines, counts, or files with matches. Prefer find for path discovery, read for full file inspection, and bash only for shell-specific tasks. Respects .gitignore and truncates long lines in output.",
-		promptSnippet: "Search file contents without falling back to bash grep",
+		promptSnippet: "Search file contents by regex or literal pattern",
 		promptGuidelines: [
 			"Use grep only when you need to search across files for patterns, symbols, or definitions — never as a substitute for reading a file.",
 			"If the user already named a specific file, use read to inspect it. Grep is for finding which files contain a pattern.",

@@ -640,8 +640,8 @@ export function registerReadTool(pi: ExtensionAPI): void {
 		promptGuidelines: [
 			"Read is the primary way to inspect file contents. When the user names a file or you need its text, read it directly — don't grep or find first.",
 			"Every read returns a snapshotId — copy it to your next edit. After editing, the result gives a new snapshotId; use that directly, no re-read needed.",
-			"Use ranges for specific line windows, outline=true to discover file structure (declarations + line numbers). Combine both in one call for structure + content.",
-			"The tool blocks unchanged re-reads automatically. Only re-read when edit returns stale_snapshot or ambiguous.",
+			"Use ranges for specific line windows, outline=true to discover file structure (declarations + line numbers). Combine both in one call to see structure and read key sections simultaneously.",
+			"Re-reading the same file with the same parameters returns a cached result. Only re-read when edit signals stale_snapshot or ambiguous match.",
 		],
 		parameters: readSchema,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {

@@ -413,13 +413,16 @@ export function registerBashTool(pi: ExtensionAPI): void {
 	pi.registerTool({
 		...builtInBash,
 		description:
-			"Execute shell commands in the current working directory. Use this for build, test, run, git, and other shell-specific tasks. Do not use it for routine file reading or code search when read, find, or grep can answer more directly. Output is truncated and long output is saved to a temp file.",
-		promptSnippet: "Run shell commands only when the task is truly shell-specific",
+			"Execute shell commands in the current working directory. Use this for build, test, run, git, and other shell-specific tasks. Do not use it for routine file reading or code search when read, find, or grep can answer more directly. Output is truncated and full output is retrievable via the artifact system.",
+		promptSnippet: "Run shell commands",
 		promptGuidelines: [
 			"Use bash for build, test, run, git, environment inspection, or commands that require shell semantics.",
 			"Do not use bash for routine file reads, path discovery, content search, or simple file writes when read, find, grep, write, or edit can answer directly.",
 			"Re-run a command only when the environment changed, the first run was incomplete, or the user asked to run it again.",
 			"Session state persists by cwd unless session=false; use resetSession=true when prior shell state may interfere.",
+			"Set timeout for commands that may hang (network calls, long builds). Default is 60s, clamped to 1-3600s.",
+			"Use the env object to pass environment variables instead of inline export statements — it avoids shell injection and quoting issues.",
+			"For long-running daemons or background tasks, use async=true to avoid blocking the session.",
 		],
 		parameters: bashSchema,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
