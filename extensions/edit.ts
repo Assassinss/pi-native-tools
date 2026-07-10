@@ -1,4 +1,5 @@
-import { createEditToolDefinition, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, generateDiffString } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
   dirname,
@@ -13,12 +14,15 @@ import {
 import { invalidateFsScanCache } from "./omp-native.ts";
 
 type EditConflictReason = "not_found" | "ambiguous" | "stale_snapshot" | "overlap" | "no_change";
+type StaleSnapshotFallback = "reject" | "apply_if_unique";
 
 type EditResultDetails =
   | {
       status: "applied";
       appliedCount: number;
       newSnapshotId: string;
+      diff?: string;
+      fallback?: "stale_snapshot_rebased";
     }
   | {
       status: "conflict";
@@ -60,6 +64,12 @@ const editSchema = Type.Object(
     ),
     replaceAll: Type.Optional(
       Type.Boolean({ description: "Replace every exact match. Default: false. Only used in legacy single-edit mode." }),
+    ),
+    staleSnapshot: Type.Optional(
+      Type.Union([
+        Type.Literal("reject"),
+        Type.Literal("apply_if_unique"),
+      ], { description: "How to handle a stale snapshot. Default: reject. apply_if_unique retries against the current file only when every oldText still matches exactly once." }),
     ),
   },
   { additionalProperties: false },
@@ -142,15 +152,17 @@ function buildAppliedResult(
   path: string,
   appliedCount: number,
   newSnapshotId: string,
+  diff?: string,
+  fallback?: "stale_snapshot_rebased",
 ): { content: Array<{ type: "text"; text: string }>; details: EditResultDetails } {
   return {
     content: [
       {
         type: "text",
-        text: `Applied ${appliedCount} replacement${appliedCount === 1 ? "" : "s"} to ${path}.\nsnapshotId: ${newSnapshotId}\nUse this snapshotId for your next edit on this file — no need to re-read.`,
+        text: `Applied ${appliedCount} replacement${appliedCount === 1 ? "" : "s"} to ${path}.${fallback ? " Rebased from a stale snapshot after unique exact-match verification." : ""}\nsnapshotId: ${newSnapshotId}\nUse this snapshotId for your next edit on this file — no need to re-read.`,
       },
     ],
-    details: { status: "applied", appliedCount, newSnapshotId },
+    details: { status: "applied", appliedCount, newSnapshotId, ...(diff ? { diff } : {}), ...(fallback ? { fallback } : {}) },
   };
 }
 
@@ -306,6 +318,7 @@ export async function executeEdit(
   replaceAll: boolean,
   signal: AbortSignal | undefined,
   cwd: string,
+  staleSnapshot: StaleSnapshotFallback = "reject",
 ): Promise<{ content: Array<{ type: string; text: string }>; details: EditResultDetails }> {
   for (const edit of edits) {
     if (edit.oldText.length === 0) {
@@ -337,7 +350,8 @@ export async function executeEdit(
     }
 
     const currentSnapshotId = rememberDocumentSnapshot(absolutePath, content);
-    if (snapshotId && snapshotId !== currentSnapshotId) {
+    const isStaleSnapshot = snapshotId !== undefined && snapshotId !== currentSnapshotId;
+    if (isStaleSnapshot && staleSnapshot === "reject") {
       return buildConflict(
         "stale_snapshot",
         `Snapshot ${snapshotId} is stale for ${path}. Re-read the file before retrying.`,
@@ -345,8 +359,8 @@ export async function executeEdit(
       );
     }
 
-    // Single unified path: applyEdits handles both batch and replaceAll modes
-    const result = applyEdits(content, edits, path, replaceAll);
+    // A stale rebase always requires unique exact matches, including replaceAll requests.
+    const result = applyEdits(content, edits, path, isStaleSnapshot ? false : replaceAll);
     if ("conflict" in result) {
       return result.conflict;
     }
@@ -359,8 +373,9 @@ export async function executeEdit(
     await writeFile(absolutePath, path, newContent, signal);
     const newSnapshotId = rememberDocumentSnapshot(absolutePath, newContent);
     invalidateScanCache(absolutePath);
+    const diff = generateDiffString(content, newContent).diff;
 
-    return buildAppliedResult(path, appliedCount, newSnapshotId);
+    return buildAppliedResult(path, appliedCount, newSnapshotId, diff, isStaleSnapshot ? "stale_snapshot_rebased" : undefined);
   });
 }
 
@@ -386,8 +401,6 @@ async function writeFile(
 }
 
 export function registerEditTool(pi: ExtensionAPI): void {
-  const builtInEdit = createEditToolDefinition(process.cwd());
-
   pi.registerTool({
     name: "edit",
     label: "edit",
@@ -399,18 +412,47 @@ export function registerEditTool(pi: ExtensionAPI): void {
       "Use unique oldText. For ambiguous matches, read a narrower region and retry with more surrounding text.",
       "Use edits[] for disjoint replacements; entries match the original snapshot and must not overlap.",
       "Use replaceAll only when every exact occurrence must change.",
+      "Use staleSnapshot=apply_if_unique only when a stale snapshot may be safely rebased through unique exact matches.",
     ],
     parameters: editSchema,
-    renderShell: builtInEdit.renderShell,
-    renderCall: builtInEdit.renderCall,
-    renderResult: builtInEdit.renderResult,
+    renderCall(args, theme) {
+      let text = theme.fg("toolTitle", theme.bold("edit "));
+      text += theme.fg("accent", args.path as string);
+      return new Text(text, 0, 0);
+    },
+    renderResult(result, { isPartial }, theme) {
+      if (isPartial) return new Text(theme.fg("warning", "Editing..."), 0, 0);
+      const details = result.details as { diff?: string; appliedCount?: number; fallback?: string } | undefined;
+      const content = result.content[0] as { type: string; text?: string } | undefined;
+      if (content?.text?.startsWith("Conflict")) {
+        return new Text(theme.fg("error", content.text.split("\n")[0]!), 0, 0);
+      }
+      if (!details?.diff) {
+        return new Text(theme.fg("success", `Applied ${details?.appliedCount ?? 0} replacement${details?.appliedCount === 1 ? "" : "s"}`), 0, 0);
+      }
+      let text = details.fallback
+        ? theme.fg("warning", `Applied ${details.appliedCount} replacement${details.appliedCount === 1 ? "" : "s"} (rebased from stale snapshot)\n`)
+        : "";
+      const diffLines = details.diff.split("\n");
+      for (const line of diffLines) {
+        if (line.startsWith("+") && !line.startsWith("+++")) {
+          text += `\n${theme.fg("success", line)}`;
+        } else if (line.startsWith("-") && !line.startsWith("---")) {
+          text += `\n${theme.fg("error", line)}`;
+        } else {
+          text += `\n${theme.fg("dim", line)}`;
+        }
+      }
+      return new Text(text, 0, 0);
+    },
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      const { path, snapshotId, oldText, newText, replaceAll, edits: editsParam } = params as {
+      const { path, snapshotId, oldText, newText, replaceAll, staleSnapshot, edits: editsParam } = params as {
         path: string;
         snapshotId?: string;
         oldText?: string;
         newText?: string;
         replaceAll?: boolean;
+        staleSnapshot?: StaleSnapshotFallback;
         edits?: EditEntry[];
       };
 
@@ -421,7 +463,7 @@ export function registerEditTool(pi: ExtensionAPI): void {
         edits: editsParam,
       });
 
-      return executeEdit(path, snapshotId, edits, resolvedReplaceAll, signal, ctx?.cwd ?? process.cwd());
+      return executeEdit(path, snapshotId, edits, resolvedReplaceAll, signal, ctx?.cwd ?? process.cwd(), staleSnapshot);
     },
   });
 }

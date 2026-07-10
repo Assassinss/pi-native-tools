@@ -22,6 +22,7 @@ test("executeEdit applies exact replacement with snapshotId", async () => {
 		const result = await executeEdit(file, snapshotId, [{ oldText: "alpha beta gamma", newText: "alpha delta gamma" }], false, undefined, dir);
 		assert.equal(result.details.status, "applied");
 		assert.equal(result.details.appliedCount, 1);
+		assert.ok((result.details as { diff?: string }).diff, "diff should be present in details");
 		assert.match(extractText(result), /Applied 1 replacement/);
 		assert.equal(await readFile(file, "utf-8"), "alpha delta gamma\n");
 	} finally {
@@ -98,6 +99,83 @@ test("executeEdit rejects stale snapshot even when oldText still exists", async 
 	}
 });
 
+test("executeEdit rebases a stale snapshot when the exact match remains unique", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-stale-rebase-unit-"));
+	try {
+		const file = join(dir, "demo.txt");
+		await writeFile(file, "before\n", "utf-8");
+		const readResult = await executeRead(file, 1, 1, undefined, dir, undefined, undefined, true);
+		const snapshotId = (readResult.details as { snapshotId?: string } | undefined)?.snapshotId;
+		assert.ok(snapshotId);
+		await writeFile(file, "unrelated\nbefore\n", "utf-8");
+
+		const result = await executeEdit(file, snapshotId, [{ oldText: "before", newText: "done" }], false, undefined, dir, "apply_if_unique");
+		assert.equal(result.details.status, "applied");
+		assert.equal(result.details.fallback, "stale_snapshot_rebased");
+		assert.ok((result.details as { diff?: string }).diff, "diff should be present in stale rebase details");
+		assert.equal(await readFile(file, "utf-8"), "unrelated\ndone\n");
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeEdit does not rebase when the stale target changed", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-stale-target-unit-"));
+	try {
+		const file = join(dir, "demo.txt");
+		await writeFile(file, "before\n", "utf-8");
+		const readResult = await executeRead(file, 1, 1, undefined, dir, undefined, undefined, true);
+		const snapshotId = (readResult.details as { snapshotId?: string } | undefined)?.snapshotId;
+		assert.ok(snapshotId);
+		await writeFile(file, "after\n", "utf-8");
+
+		const result = await executeEdit(file, snapshotId, [{ oldText: "before", newText: "done" }], false, undefined, dir, "apply_if_unique");
+		assert.equal(result.details.status, "conflict");
+		assert.equal(result.details.reason, "not_found");
+		assert.equal(await readFile(file, "utf-8"), "after\n");
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeEdit does not rebase when the stale target becomes ambiguous", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-stale-ambiguous-unit-"));
+	try {
+		const file = join(dir, "demo.txt");
+		await writeFile(file, "before\n", "utf-8");
+		const readResult = await executeRead(file, 1, 1, undefined, dir, undefined, undefined, true);
+		const snapshotId = (readResult.details as { snapshotId?: string } | undefined)?.snapshotId;
+		assert.ok(snapshotId);
+		await writeFile(file, "before\nbefore\n", "utf-8");
+
+		const result = await executeEdit(file, snapshotId, [{ oldText: "before", newText: "done" }], false, undefined, dir, "apply_if_unique");
+		assert.equal(result.details.status, "conflict");
+		assert.equal(result.details.reason, "ambiguous");
+		assert.equal(await readFile(file, "utf-8"), "before\nbefore\n");
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeEdit does not rebase a stale replaceAll request across multiple matches", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-stale-replace-all-unit-"));
+	try {
+		const file = join(dir, "demo.txt");
+		await writeFile(file, "before\n", "utf-8");
+		const readResult = await executeRead(file, 1, 1, undefined, dir, undefined, undefined, true);
+		const snapshotId = (readResult.details as { snapshotId?: string } | undefined)?.snapshotId;
+		assert.ok(snapshotId);
+		await writeFile(file, "before\nbefore\n", "utf-8");
+
+		const result = await executeEdit(file, snapshotId, [{ oldText: "before", newText: "done" }], true, undefined, dir, "apply_if_unique");
+		assert.equal(result.details.status, "conflict");
+		assert.equal(result.details.reason, "ambiguous");
+		assert.equal(await readFile(file, "utf-8"), "before\nbefore\n");
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
 test("executeEdit supports replaceAll", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-all-unit-"));
 	try {
@@ -159,6 +237,21 @@ test("executeEdit returns conflict for not_found in batch edit", async () => {
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
+});
+
+test("registerEditTool does not attach the built-in edit preview renderer", () => {
+	let definition: Record<string, unknown> | undefined;
+	registerEditTool({
+		registerTool(def: Record<string, unknown>) {
+			definition = def;
+		},
+	} as any);
+	assert.ok(definition);
+	// Must not use the built-in renderShell (which would trigger preview side-effects)
+	assert.equal(definition.renderShell, undefined);
+	// Must have its own minimal renderCall/renderResult (not the built-in ones)
+	assert.equal(typeof definition.renderCall, "function");
+	assert.equal(typeof definition.renderResult, "function");
 });
 
 test("registerEditTool rejects mixed legacy and batch params", async () => {
