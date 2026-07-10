@@ -477,14 +477,14 @@ export function registerEditTool(pi: ExtensionAPI): void {
           ? renderDiff(state.preview.diff, theme)
           : theme.fg("error", state.preview.error));
       }
-      return new Text(text, 0, 0);
+      return new Text(text, 1, 0);
     },
     renderResult(result, { isPartial }, theme) {
-      if (isPartial) return new Text(theme.fg("warning", "Editing..."), 0, 0);
+      if (isPartial) return new Text(theme.fg("warning", "Editing..."), 1, 0);
       const details = result.details as { diff?: string; appliedCount?: number; fallback?: string } | undefined;
       const content = result.content[0] as { type: string; text?: string } | undefined;
       if (content?.text?.startsWith("Conflict")) {
-        return new Text(theme.fg("error", content.text.split("\n")[0]!), 0, 0);
+        return new Text(theme.fg("error", content.text.split("\n")[0]!), 1, 0);
       }
       if (!details?.diff) {
         return new Text(theme.fg("success", `Applied ${details?.appliedCount ?? 0} replacement${details?.appliedCount === 1 ? "" : "s"}`), 0, 0);
@@ -492,7 +492,7 @@ export function registerEditTool(pi: ExtensionAPI): void {
       let text = details.fallback
         ? theme.fg("warning", `Applied ${details.appliedCount} replacement${details.appliedCount === 1 ? "" : "s"} (rebased from stale snapshot)\n`)
         : "";
-      return new Text(`${text}\n${renderDiff(details.diff, theme)}`, 0, 0);
+      return new Text(`${text}\n${renderDiff(details.diff, theme)}`, 1, 0);
     },
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const { path, snapshotId, oldText, newText, replaceAll, staleSnapshot, edits: editsParam } = params as {
