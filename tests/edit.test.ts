@@ -29,6 +29,23 @@ test("executeEdit applies exact replacement with snapshotId", async () => {
 	}
 });
 
+test("executeEdit replaces text copied from read output", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-read-copy-unit-"));
+	try {
+		const file = join(dir, "demo.txt");
+		await writeFile(file, "before\r\nafter\r\n", "utf-8");
+		const readResult = await executeRead(file, 1, 2, undefined, dir, undefined, undefined, true);
+		const snapshotId = (readResult.details as { snapshotId?: string } | undefined)?.snapshotId;
+		assert.ok(snapshotId);
+
+		const result = await executeEdit(file, snapshotId, [{ oldText: "before\nafter\n", newText: "done\n" }], false, undefined, dir);
+		assert.equal(result.details.status, "applied");
+		assert.equal(await readFile(file, "utf-8"), "done\n");
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
 test("executeEdit returns ambiguous when oldText matches more than once", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-ambiguous-unit-"));
 	try {

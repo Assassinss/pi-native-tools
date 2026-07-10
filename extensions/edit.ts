@@ -85,6 +85,19 @@ function findMatchIndices(content: string, needle: string): number[] {
   return matches;
 }
 
+function findCompatibleMatches(content: string, oldText: string): { oldText: string; matches: number[] } {
+  const exact = findMatchIndices(content, oldText);
+  if (exact.length > 0 || !oldText.includes("\n")) return { oldText, matches: exact };
+
+  // Readable output and pasted text may normalize CRLF to LF; no other whitespace is relaxed.
+  for (const candidate of [oldText.replace(/\r\n/g, "\n"), oldText.replace(/\r?\n/g, "\r\n")]) {
+    if (candidate === oldText) continue;
+    const matches = findMatchIndices(content, candidate);
+    if (matches.length > 0) return { oldText: candidate, matches };
+  }
+  return { oldText, matches: [] };
+}
+
 function buildPreview(content: string, index: number, needle: string): string {
   const previewRadius = 30;
   const start = Math.max(0, index - previewRadius);
@@ -164,16 +177,16 @@ function applyEdits(
     if (single.oldText === single.newText) {
       return { conflict: buildConflict("no_change", `Edit made no changes to ${path}.`) };
     }
-    const matches = findMatchIndices(content, single.oldText);
-    if (matches.length === 0) {
-      return { conflict: buildConflict("not_found", `oldText was not found in ${path}.`) };
+    const match = findCompatibleMatches(content, single.oldText);
+    if (match.matches.length === 0) {
+      return { conflict: buildConflict("not_found", `oldText was not found in ${path}. Re-read the current text and retry.`) };
     }
-    const positions: ResolvedEdit[] = matches.map((index) => ({
+    const positions: ResolvedEdit[] = match.matches.map((index) => ({
       index,
-      oldText: single.oldText,
+      oldText: match.oldText,
       newText: single.newText,
     }));
-    return { newContent: buildAppliedContent(content, positions), appliedCount: matches.length };
+    return { newContent: buildAppliedContent(content, positions), appliedCount: match.matches.length };
   }
 
   // Batch mode: each edit must match exactly once and not overlap
@@ -182,7 +195,8 @@ function applyEdits(
   }
   const positions: ResolvedEdit[] = [];
   for (const edit of edits) {
-    const matches = findMatchIndices(content, edit.oldText);
+    const match = findCompatibleMatches(content, edit.oldText);
+    const { matches } = match;
     if (matches.length === 0) {
       return {
         conflict: buildConflict(
@@ -205,7 +219,7 @@ function applyEdits(
         ),
       };
     }
-    positions.push({ index: matches[0], oldText: edit.oldText, newText: edit.newText });
+    positions.push({ index: matches[0], oldText: match.oldText, newText: edit.newText });
   }
 
   // Check for overlaps (positions are in discovery order, sort by index)
@@ -380,13 +394,11 @@ export function registerEditTool(pi: ExtensionAPI): void {
     description: "Edit a file by replacing exact oldText with newText, ideally against a read snapshot so stale edits can be detected. Use edits[] for multiple disjoint replacements in one call.",
     promptSnippet: "Apply exact oldText/newText replacements with snapshot checks",
     promptGuidelines: [
-      "Always read the file first to get current text and snapshotId. Never edit a file you haven't read.",
-      "Include snapshotId from the most recent read or edit of that file. Edits without snapshotId silently overwrite concurrent changes — only omit it for newly created files that have no prior snapshot.",
-      "After a successful edit, the response includes a new snapshotId. Use it for your next edit on the same file — no need to re-read.",
-      "Prefer unique oldText snippets. If edit returns ambiguous, read a smaller region and retry with a longer oldText.",
-      "Use replaceAll with extreme caution — it replaces every exact match in the file. Prefer edits[] to target each location precisely, and only use replaceAll when you are certain every occurrence must change.",
-      "Batch non-overlapping changes into one edits[] call. Overlapping edits in the same call will be rejected.",
-      "Each edits[].oldText is matched against the original file snapshot, not against intermediate results.",
+      "Before the first edit of an existing file, read it and pass its latest snapshotId.",
+      "After an edit, reuse the returned snapshotId; re-read only when context changed or a conflict occurs.",
+      "Use unique oldText. For ambiguous matches, read a narrower region and retry with more surrounding text.",
+      "Use edits[] for disjoint replacements; entries match the original snapshot and must not overlap.",
+      "Use replaceAll only when every exact occurrence must change.",
     ],
     parameters: editSchema,
     renderShell: builtInEdit.renderShell,

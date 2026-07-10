@@ -2,7 +2,6 @@ import {
 	createBashToolDefinition,
 	type BashToolDetails,
 	DEFAULT_MAX_BYTES,
-	DEFAULT_MAX_LINES,
 	formatSize,
 	truncateTail,
 	type TruncationResult,
@@ -44,6 +43,8 @@ const bashSchema = Type.Object(
 	},
 	{ additionalProperties: false },
 );
+const MODEL_MAX_BYTES = 16 * 1024;
+const MODEL_MAX_LINES = 500;
 const shellSessions = new Map<string, Shell>();
 const shellSessionsInitialized = new Set<string>();
 const shellSessionsInUse = new Set<string>();
@@ -58,9 +59,22 @@ function byteLength(text: string): number {
 	return Buffer.byteLength(text, "utf-8");
 }
 
+function compactOutput(text: string): string {
+	const lines = text.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "").replace(/\r/g, "").split("\n");
+	const compacted: string[] = [];
+	for (let start = 0; start < lines.length;) {
+		let end = start + 1;
+		while (end < lines.length && lines[end] === lines[start]) end++;
+		const line = lines[start];
+		if (line || compacted.at(-1) !== "") compacted.push(end - start > 1 && line ? `${line} [repeated ${end - start} times]` : line);
+		start = end;
+	}
+	return compacted.join("\n");
+}
+
 class OutputAccumulator {
-	private readonly maxLines = DEFAULT_MAX_LINES;
-	private readonly maxBytes = DEFAULT_MAX_BYTES;
+	private readonly maxLines = MODEL_MAX_LINES;
+	private readonly maxBytes = MODEL_MAX_BYTES;
 	private readonly maxRollingBytes = Math.max(DEFAULT_MAX_BYTES * 2, 1);
 	private readonly tempFilePrefix = "pi-bash-native";
 	private readonly rawChunks: Buffer[] = [];
@@ -251,7 +265,7 @@ export function clearBashSessions(): void {
 
 function formatOutput(snapshot: OutputSnapshot, emptyText = "(no output)"): { text: string; details?: BashToolDetails } {
 	const truncation = snapshot.truncation;
-	let text = snapshot.content || emptyText;
+	let text = compactOutput(snapshot.content) || emptyText;
 	let details: BashToolDetails | undefined;
 	if (truncation.truncated) {
 		details = { truncation, fullOutputPath: snapshot.fullOutputPath };
@@ -262,7 +276,7 @@ function formatOutput(snapshot: OutputSnapshot, emptyText = "(no output)"): { te
 		} else if (truncation.truncatedBy === "lines") {
 			text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines}. Full output: ${snapshot.fullOutputPath}]`;
 		} else {
-			text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). Full output: ${snapshot.fullOutputPath}]`;
+			text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines} (${formatSize(MODEL_MAX_BYTES)} limit). Full output: ${snapshot.fullOutputPath}]`;
 		}
 	}
 	return { text, details };
@@ -416,13 +430,11 @@ export function registerBashTool(pi: ExtensionAPI): void {
 			"Execute shell commands in the current working directory. Use this for build, test, run, git, and other shell-specific tasks. Do not use it for routine file reading or code search when read, find, or grep can answer more directly. Output is truncated and full output is retrievable via the artifact system.",
 		promptSnippet: "Run shell commands",
 		promptGuidelines: [
-			"Use bash for build, test, run, git, environment inspection, or commands that require shell semantics.",
-			"Do not use bash for routine file reads, path discovery, content search, or simple file writes when read, find, grep, write, or edit can answer directly.",
-			"Re-run a command only when the environment changed, the first run was incomplete, or the user asked to run it again.",
-			"Session state persists by cwd unless session=false; use resetSession=true when prior shell state may interfere.",
-			"Set timeout for commands that may hang (network calls, long builds). Default is 60s, clamped to 1-3600s.",
-			"Use the env object to pass environment variables instead of inline export statements — it avoids shell injection and quoting issues.",
-			"For long-running daemons or background tasks, use async=true to avoid blocking the session.",
+			"Use bash only for shell-dependent work such as builds, tests, git, or environment inspection.",
+			"Use read, find, grep, write, or edit for file operations and searches.",
+			"Prefer commands with concise output; filter verbose success logs and preserve failure details.",
+			"Set timeout for commands that may run for a long time.",
+			"Sessions persist per cwd; use session=false for isolation or resetSession=true to discard state.",
 		],
 		parameters: bashSchema,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {

@@ -229,6 +229,26 @@ test("registered native grep supports count and filesWithMatches modes", async (
 	}
 });
 
+test("registered native grep limits repetitive matches per file", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-native-grep-compact-"));
+	try {
+		const pi = createPiStub();
+		extension(pi as any);
+		const write = pi.tools.get("write");
+		const grep = pi.tools.get("grep");
+		assert.ok(write);
+		assert.ok(grep);
+
+		await write!.execute("1", { path: join(dir, "many.ts"), content: Array(10).fill("needle").join("\n") }, undefined, undefined, { cwd: dir });
+		const result = await grep!.execute("2", { pattern: "needle", path: dir }, undefined, undefined, { cwd: dir });
+		const text = extractText(result);
+		assert.equal((text.match(/many\.ts:\d+: needle/g) ?? []).length, 8);
+		assert.match(text, /2 matches in 1 files omitted/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
 test("registered read reports offset past EOF for streamed files", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-tools-read-stream-eof-"));
 	try {
@@ -280,6 +300,21 @@ test("registered native bash keeps session state across calls", async () => {
 		const first = await bash!.execute("1", { command: "cd .. && pwd" }, undefined, undefined, { cwd: dir });
 		const second = await bash!.execute("2", { command: "pwd" }, undefined, undefined, { cwd: dir });
 		assert.equal(extractText(second).trim(), extractText(first).trim());
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("registered native bash compacts repeated output", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-native-bash-compact-"));
+	try {
+		const pi = createPiStub();
+		extension(pi as any);
+		const bash = pi.tools.get("bash");
+		assert.ok(bash);
+
+		const result = await bash!.execute("1", { command: "printf 'noise\\n%.0s' {1..10}" }, undefined, undefined, { cwd: dir });
+		assert.equal(extractText(result).trim(), "noise [repeated 10 times]");
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}

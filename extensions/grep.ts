@@ -2,7 +2,6 @@ import {
 	createGrepToolDefinition,
 	type ExtensionAPI,
 	type GrepToolDetails,
-	DEFAULT_MAX_BYTES,
 	formatSize,
 	truncateHead,
 	truncateLine,
@@ -20,6 +19,11 @@ function grepError(code: string, message: string, hint?: string, details?: Recor
 const builtInGrep = createGrepToolDefinition(process.cwd());
 const DEFAULT_LIMIT = 100;
 const SEARCH_TIMEOUT_MS = 30_000;
+const MODEL_MAX_BYTES = 16 * 1024;
+const MODEL_MAX_LINES = 500;
+const MAX_MATCHES_PER_FILE = 8;
+const MAX_MATCH_FILES = 40;
+const MAX_MATCHES = 120;
 const GREP_MAX_LINE_LENGTH = 500; // ponytail: match pi built-in truncate width without depending on an internal runtime export
 const grepSchema = Type.Object(
 	{
@@ -137,6 +141,27 @@ function formatLimitNotice(mode: GrepMode, effectiveLimit: number): string {
 	return `${effectiveLimit} results limit reached. Use limit=${effectiveLimit * 2} for more, or refine pattern`;
 }
 
+function limitContentMatches(matches: GrepMatch[]): { matches: GrepMatch[]; omitted: number; omittedFiles: number } {
+	const perFile = new Map<string, number>();
+	const files = new Set<string>();
+	const limited: GrepMatch[] = [];
+	let omitted = 0;
+	const omittedFiles = new Set<string>();
+
+	for (const match of matches) {
+		const fileMatches = perFile.get(match.path) ?? 0;
+		if (limited.length >= MAX_MATCHES || (!files.has(match.path) && files.size >= MAX_MATCH_FILES) || fileMatches >= MAX_MATCHES_PER_FILE) {
+			omitted++;
+			omittedFiles.add(match.path);
+			continue;
+		}
+		files.add(match.path);
+		perFile.set(match.path, fileMatches + 1);
+		limited.push(match);
+	}
+	return { matches: limited, omitted, omittedFiles: omittedFiles.size };
+}
+
 function buildGrepResponse(
 	mode: GrepMode,
 	matches: GrepMatch[],
@@ -150,8 +175,9 @@ function buildGrepResponse(
 		return { content: [{ type: "text", text: "No matches found" }], details: undefined };
 	}
 
-	const formatted = formatGrepOutput(mode, matches, isDirectory, searchPath, contextValue);
-	const truncation = truncateHead(formatted.text, { maxLines: Number.MAX_SAFE_INTEGER });
+	const limited = mode === "content" ? limitContentMatches(matches) : { matches, omitted: 0, omittedFiles: 0 };
+	const formatted = formatGrepOutput(mode, limited.matches, isDirectory, searchPath, contextValue);
+	const truncation = truncateHead(formatted.text, { maxBytes: MODEL_MAX_BYTES, maxLines: MODEL_MAX_LINES });
 	let text = truncation.content;
 	const details: GrepToolDetails = {};
 	const notices: string[] = [];
@@ -159,8 +185,11 @@ function buildGrepResponse(
 		notices.push(formatLimitNotice(mode, effectiveLimit));
 		details.matchLimitReached = effectiveLimit;
 	}
+	if (limited.omitted > 0) {
+		notices.push(`${limited.omitted} matches in ${limited.omittedFiles} files omitted (max ${MAX_MATCHES_PER_FILE}/file, ${MAX_MATCH_FILES} files, ${MAX_MATCHES} matches)`);
+	}
 	if (truncation.truncated) {
-		notices.push(`${formatSize(DEFAULT_MAX_BYTES)} limit reached`);
+		notices.push(`${formatSize(MODEL_MAX_BYTES)} or ${MODEL_MAX_LINES} lines limit reached`);
 		details.truncation = truncation;
 	}
 	if (formatted.linesTruncated) {
@@ -253,11 +282,11 @@ export function registerGrepTool(pi: ExtensionAPI): void {
 			"Search file contents by regex or literal pattern. Use this when you need matching lines, counts, or files with matches. Prefer find for path discovery, read for full file inspection, and bash only for shell-specific tasks. Respects .gitignore and truncates long lines in output.",
 		promptSnippet: "Search file contents by regex or literal pattern",
 		promptGuidelines: [
-			"Use grep only when you need to search across files for patterns, symbols, or definitions — never as a substitute for reading a file.",
-			"If the user already named a specific file, use read to inspect it. Grep is for finding which files contain a pattern.",
-			"If grep returns file paths, read those files next to get their content — don't grep them again.",
-			"Use literal=true for exact code snippets, function calls, or text containing regex metacharacters like ()[]{}?.+*.",
-			"Use mode=count for totals and mode=filesWithMatches for file-name-only results.",
+			"Search across files only; use read when the file path is already known.",
+			"Narrow searches with path and glob. Keep context=0 unless adjacent lines are needed.",
+			"Use mode=filesWithMatches to locate files and mode=count for totals before requesting content.",
+			"Use literal=true for exact text containing regex metacharacters.",
+			"Read returned files for full context instead of repeatedly grepping them.",
 		],
 		parameters: grepSchema,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
