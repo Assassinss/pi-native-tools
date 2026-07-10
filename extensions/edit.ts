@@ -77,6 +77,8 @@ const editSchema = Type.Object(
 
 type EditEntry = Type.Static<typeof replaceEditSchema>;
 type ResolvedEdit = EditEntry & { index: number };
+type EditPreview = { diff: string } | { error: string };
+type EditRenderState = { preview?: EditPreview; previewArgsKey?: string; previewPending?: boolean };
 
 function editError(code: string, message: string, hint?: string, details?: Record<string, unknown>): Error {
   return toolError({ tool: "edit", code, message, hint, details });
@@ -146,6 +148,40 @@ function buildAppliedContent(content: string, edits: ResolvedEdit[]): string {
   }
   parts.push(content.slice(cursor));
   return parts.join("");
+}
+
+function getPreviewInput(args: unknown): { path: string; edits: EditEntry[]; replaceAll: boolean } | undefined {
+  if (!args || typeof args !== "object") return undefined;
+  const input = args as { path?: unknown; edits?: unknown; oldText?: unknown; newText?: unknown; replaceAll?: unknown };
+  if (typeof input.path !== "string") return undefined;
+  if (Array.isArray(input.edits) && input.edits.length > 0 && input.edits.every((edit) =>
+    edit && typeof edit === "object" && typeof (edit as EditEntry).oldText === "string" && typeof (edit as EditEntry).newText === "string",
+  )) {
+    return { path: input.path, edits: input.edits as EditEntry[], replaceAll: false };
+  }
+  if (typeof input.oldText === "string" && typeof input.newText === "string") {
+    return { path: input.path, edits: [{ oldText: input.oldText, newText: input.newText }], replaceAll: input.replaceAll === true };
+  }
+  return undefined;
+}
+
+async function computeEditPreview(input: { path: string; edits: EditEntry[]; replaceAll: boolean }, cwd: string): Promise<EditPreview> {
+  try {
+    const content = (await readFile(normalizePath(input.path, cwd))).toString("utf-8");
+    const result = applyEdits(content, input.edits, input.path, input.replaceAll);
+    if ("conflict" in result) return { error: result.conflict.details.message };
+    return { diff: generateDiffString(content, result.newContent).diff };
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+function renderDiff(diff: string, theme: { fg(color: "toolDiffAdded" | "toolDiffRemoved" | "toolDiffContext", text: string): string }): string {
+  return diff.split("\n").map((line) => {
+    if (line.startsWith("+") && !line.startsWith("+++")) return theme.fg("toolDiffAdded", line);
+    if (line.startsWith("-") && !line.startsWith("---")) return theme.fg("toolDiffRemoved", line);
+    return theme.fg("toolDiffContext", line);
+  }).join("\n");
 }
 
 function buildAppliedResult(
@@ -415,9 +451,32 @@ export function registerEditTool(pi: ExtensionAPI): void {
       "Use staleSnapshot=apply_if_unique only when a stale snapshot may be safely rebased through unique exact matches.",
     ],
     parameters: editSchema,
-    renderCall(args, theme) {
-      let text = theme.fg("toolTitle", theme.bold("edit "));
-      text += theme.fg("accent", args.path as string);
+    renderCall(args, theme, context) {
+      const state = context.state as EditRenderState;
+      const previewInput = getPreviewInput(args);
+      const previewArgsKey = previewInput ? JSON.stringify(previewInput) : undefined;
+      if (state.previewArgsKey !== previewArgsKey) {
+        state.preview = undefined;
+        state.previewArgsKey = previewArgsKey;
+        state.previewPending = false;
+      }
+      if (context.argsComplete && previewInput && !state.preview && !state.previewPending) {
+        state.previewPending = true;
+        void computeEditPreview(previewInput, context.cwd).then((preview) => {
+          if (state.previewArgsKey !== previewArgsKey) return;
+          state.preview = preview;
+          state.previewPending = false;
+          context.invalidate();
+        });
+      }
+
+      let text = theme.fg("toolTitle", theme.bold("edit ")) + theme.fg("accent", previewInput?.path ?? String((args as { path?: unknown })?.path ?? ""));
+      if (state.previewPending) text += `\n${theme.fg("warning", "Calculating preview...")}`;
+      if (state.preview) {
+        text += "\n" + ("diff" in state.preview
+          ? renderDiff(state.preview.diff, theme)
+          : theme.fg("error", state.preview.error));
+      }
       return new Text(text, 0, 0);
     },
     renderResult(result, { isPartial }, theme) {
@@ -433,17 +492,7 @@ export function registerEditTool(pi: ExtensionAPI): void {
       let text = details.fallback
         ? theme.fg("warning", `Applied ${details.appliedCount} replacement${details.appliedCount === 1 ? "" : "s"} (rebased from stale snapshot)\n`)
         : "";
-      const diffLines = details.diff.split("\n");
-      for (const line of diffLines) {
-        if (line.startsWith("+") && !line.startsWith("+++")) {
-          text += `\n${theme.fg("toolDiffAdded", line)}`;
-        } else if (line.startsWith("-") && !line.startsWith("---")) {
-          text += `\n${theme.fg("toolDiffRemoved", line)}`;
-        } else {
-          text += `\n${theme.fg("toolDiffContext", line)}`;
-        }
-      }
-      return new Text(text, 0, 0);
+      return new Text(`${text}\n${renderDiff(details.diff, theme)}`, 0, 0);
     },
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const { path, snapshotId, oldText, newText, replaceAll, staleSnapshot, edits: editsParam } = params as {

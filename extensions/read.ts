@@ -1,5 +1,7 @@
-import type { ExtensionAPI, ReadToolDetails } from "@earendil-works/pi-coding-agent";
+import { convertToPng, formatDimensionNote, resizeImage, type ExtensionAPI, type ReadToolDetails } from "@earendil-works/pi-coding-agent";
+import type { ImageContent } from "@earendil-works/pi-ai";
 import type { TextContent } from "./shared.ts";
+import { open } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
 import { basename, extname } from "node:path";
 import { Type } from "typebox";
@@ -144,6 +146,41 @@ function readError(code: string, message: string, hint?: string, details?: Recor
 function formatOffsetOutOfRangeMessage(offset: number, totalLines: number): string {
 	if (totalLines === 0) return `Line ${offset} is beyond end of file (0 lines total). The file is empty.`;
 	return `Line ${offset} is beyond end of file (${totalLines} lines total). Use offset=1 to read from the start, or offset=${totalLines} to read the last line.`;
+}
+
+function detectImageMimeType(buffer: Buffer): string | undefined {
+	if (buffer.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))) return "image/jpeg";
+	if (buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
+	if (buffer.subarray(0, 6).toString("ascii") === "GIF87a" || buffer.subarray(0, 6).toString("ascii") === "GIF89a") return "image/gif";
+	if (buffer.subarray(0, 2).toString("ascii") === "BM") return "image/bmp";
+	if (buffer.subarray(0, 4).toString("ascii") === "RIFF" && buffer.subarray(8, 12).toString("ascii") === "WEBP") return "image/webp";
+	return undefined;
+}
+
+async function readImageHeader(path: string): Promise<Buffer> {
+	const file = await open(path, "r");
+	try {
+		const header = Buffer.alloc(12);
+		const { bytesRead } = await file.read(header, 0, header.length, 0);
+		return header.subarray(0, bytesRead);
+	} finally {
+		await file.close();
+	}
+}
+
+async function prepareImage(image: Buffer, mimeType: string): Promise<{ data: string; mimeType: string; note?: string } | undefined> {
+	let data = image.toString("base64");
+	let normalizedMimeType = mimeType;
+	if (mimeType === "image/bmp") {
+		const converted = await convertToPng(data, mimeType);
+		if (!converted) return undefined;
+		data = converted.data;
+		normalizedMimeType = converted.mimeType;
+	}
+
+	const resized = await resizeImage(Buffer.from(data, "base64"), normalizedMimeType);
+	if (!resized) return undefined;
+	return { data: resized.data, mimeType: resized.mimeType, note: formatDimensionNote(resized) };
 }
 
 function detectBinaryContent(buffer: Buffer, path: string): void {
@@ -533,7 +570,7 @@ export async function executeRead(
 	ranges?: ReadRangeRequest[],
 	outline?: boolean,
 	force?: boolean,
-): Promise<{ content: TextContent[]; details: ReadDetails | undefined }> {
+): Promise<{ content: Array<TextContent | ImageContent>; details: ReadDetails | undefined }> {
 	validateReadArguments(offset, limit, ranges, outline);
 	const normalizedRanges = ranges && ranges.length > 0 ? normalizeReadRanges(ranges) : undefined;
 	const absolutePath = normalizePath(path, cwd);
@@ -551,6 +588,29 @@ export async function executeRead(
 		);
 	}
 	throwIfAborted(signal);
+
+	const mimeType = detectImageMimeType(await readImageHeader(absolutePath));
+	throwIfAborted(signal);
+	if (mimeType) {
+		const image = await readFile(absolutePath);
+		throwIfAborted(signal);
+		const snapshotId = createStatRevisionId(fileStat);
+		const prepared = await prepareImage(image, mimeType);
+		throwIfAborted(signal);
+		if (!prepared) {
+			return {
+				content: [{ type: "text", text: `Read image file [${mimeType}]\n[Image omitted: could not be resized below the inline image size limit.]\nsnapshotId: ${snapshotId}` }],
+				details: { snapshotId },
+			};
+		}
+		return {
+			content: [
+				{ type: "text", text: `Read image file [${prepared.mimeType}]${prepared.note ? `\n${prepared.note}` : ""}\nsnapshotId: ${snapshotId}` },
+				{ type: "image", data: prepared.data, mimeType: prepared.mimeType },
+			],
+			details: { snapshotId },
+		};
+	}
 
 	// ponytail: dedup unchanged re-reads; outline-only is exempt, outline+ranges dedups the ranges part
 	if (!force) {
@@ -635,7 +695,7 @@ export function registerReadTool(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "read",
 		label: "read",
-		description: `Read the contents of a file. For text files, output is truncated to ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB. Use offset/limit for large files, or ranges for explicit line windows with optional context. Large files (>5MB) are streamed to avoid OOM.`,
+		description: `Read text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. Text output is truncated to ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB. Use offset/limit for large files, or ranges for explicit line windows with optional context. Large text files (>5MB) are streamed to avoid OOM.`,
 		promptSnippet: "Read file contents",
 		promptGuidelines: [
 			"Read is the primary way to inspect file contents. When the user names a file or you need its text, read it directly — don't grep or find first.",

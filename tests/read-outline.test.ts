@@ -9,6 +9,29 @@ function extractText(result: { content: Array<{ type: string; text: string }> })
 	return result.content.map((item) => item.text).join("\n");
 }
 
+test("executeRead returns supported images as attachments", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-read-image-"));
+	try {
+		const file = join(dir, "pixel");
+		const image = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADElEQVR42mNk+M/wHwAF/gL+CBdQ2QAAAABJRU5ErkJggg==", "base64");
+		await writeFile(file, image);
+
+		const result = await executeRead(file, undefined, undefined, undefined, dir);
+		assert.equal(result.content[0]?.type, "text");
+		const text = (result.content[0] as { type: "text"; text: string }).text;
+		assert.match(text, /Read image file \[image\/png\]/);
+		assert.match((result.details as { snapshotId?: string })?.snapshotId ?? "", /^rev_/);
+		if (result.content[1]) {
+			assert.equal(result.content[1].type, "image");
+			assert.equal((result.content[1] as { mimeType: string }).mimeType, "image/png");
+		} else {
+			assert.match(text, /Image omitted: could not be resized/);
+		}
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
 test("executeRead outline returns structural declarations for TypeScript", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-read-outline-ts-"));
 	try {
