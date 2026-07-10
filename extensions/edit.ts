@@ -436,11 +436,11 @@ export function registerEditTool(pi: ExtensionAPI): void {
       const diffLines = details.diff.split("\n");
       for (const line of diffLines) {
         if (line.startsWith("+") && !line.startsWith("+++")) {
-          text += `\n${theme.fg("success", line)}`;
+          text += `\n${theme.fg("toolDiffAdded", line)}`;
         } else if (line.startsWith("-") && !line.startsWith("---")) {
-          text += `\n${theme.fg("error", line)}`;
+          text += `\n${theme.fg("toolDiffRemoved", line)}`;
         } else {
-          text += `\n${theme.fg("dim", line)}`;
+          text += `\n${theme.fg("toolDiffContext", line)}`;
         }
       }
       return new Text(text, 0, 0);
