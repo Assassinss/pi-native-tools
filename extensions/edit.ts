@@ -97,17 +97,23 @@ function findMatchIndices(content: string, needle: string): number[] {
   return matches;
 }
 
-function findCompatibleMatches(content: string, oldText: string): { oldText: string; matches: number[] } {
-  const exact = findMatchIndices(content, oldText);
-  if (exact.length > 0 || !oldText.includes("\n")) return { oldText, matches: exact };
+function normalizeToLf(text: string): string {
+  return text.replace(/\r\n?/g, "\n");
+}
 
-  // Readable output and pasted text may normalize CRLF to LF; no other whitespace is relaxed.
-  for (const candidate of [oldText.replace(/\r\n/g, "\n"), oldText.replace(/\r?\n/g, "\r\n")]) {
-    if (candidate === oldText) continue;
-    const matches = findMatchIndices(content, candidate);
-    if (matches.length > 0) return { oldText: candidate, matches };
-  }
-  return { oldText, matches: [] };
+function prepareContent(rawContent: string): { content: string; bom: string; lineEnding: "\n" | "\r\n" } {
+  const bom = rawContent.startsWith("\uFEFF") ? "\uFEFF" : "";
+  const content = bom ? rawContent.slice(1) : rawContent;
+  return { content: normalizeToLf(content), bom, lineEnding: content.includes("\r\n") ? "\r\n" : "\n" };
+}
+
+function restoreContent(content: string, bom: string, lineEnding: "\n" | "\r\n"): string {
+  return bom + (lineEnding === "\r\n" ? content.replace(/\n/g, "\r\n") : content);
+}
+
+function findCompatibleMatches(content: string, oldText: string): { oldText: string; matches: number[] } {
+  const normalizedOldText = normalizeToLf(oldText);
+  return { oldText: normalizedOldText, matches: findMatchIndices(content, normalizedOldText) };
 }
 
 function buildPreview(content: string, index: number, needle: string): string {
@@ -167,7 +173,8 @@ function getPreviewInput(args: unknown): { path: string; edits: EditEntry[]; rep
 
 async function computeEditPreview(input: { path: string; edits: EditEntry[]; replaceAll: boolean }, cwd: string): Promise<EditPreview> {
   try {
-    const content = (await readFile(normalizePath(input.path, cwd))).toString("utf-8");
+    const rawContent = (await readFile(normalizePath(input.path, cwd))).toString("utf-8");
+    const { content } = prepareContent(rawContent);
     const result = applyEdits(content, input.edits, input.path, input.replaceAll);
     if ("conflict" in result) return { error: result.conflict.details.message };
     return { diff: generateDiffString(content, result.newContent).diff };
@@ -222,7 +229,8 @@ function applyEdits(
   if (allowMultiple) {
     // ReplaceAll mode: single edit, replace every occurrence
     const single = edits[0];
-    if (single.oldText === single.newText) {
+    const normalizedNewText = normalizeToLf(single.newText);
+    if (normalizeToLf(single.oldText) === normalizedNewText) {
       return { conflict: buildConflict("no_change", `Edit made no changes to ${path}.`) };
     }
     const match = findCompatibleMatches(content, single.oldText);
@@ -232,13 +240,13 @@ function applyEdits(
     const positions: ResolvedEdit[] = match.matches.map((index) => ({
       index,
       oldText: match.oldText,
-      newText: single.newText,
+      newText: normalizedNewText,
     }));
     return { newContent: buildAppliedContent(content, positions), appliedCount: match.matches.length };
   }
 
   // Batch mode: each edit must match exactly once and not overlap
-  if (edits.every((e) => e.oldText === e.newText)) {
+  if (edits.every((e) => normalizeToLf(e.oldText) === normalizeToLf(e.newText))) {
     return { conflict: buildConflict("no_change", `Edit made no changes to ${path}.`) };
   }
   const positions: ResolvedEdit[] = [];
@@ -267,7 +275,7 @@ function applyEdits(
         ),
       };
     }
-    positions.push({ index: matches[0], oldText: match.oldText, newText: edit.newText });
+    positions.push({ index: matches[0], oldText: match.oldText, newText: normalizeToLf(edit.newText) });
   }
 
   // Check for overlaps (positions are in discovery order, sort by index)
@@ -395,21 +403,24 @@ export async function executeEdit(
       );
     }
 
+    // Match and edit normalized text, then restore the file's BOM and line endings.
+    const { content: normalizedContent, bom, lineEnding } = prepareContent(content);
     // A stale rebase always requires unique exact matches, including replaceAll requests.
-    const result = applyEdits(content, edits, path, isStaleSnapshot ? false : replaceAll);
+    const result = applyEdits(normalizedContent, edits, path, isStaleSnapshot ? false : replaceAll);
     if ("conflict" in result) {
       return result.conflict;
     }
 
-    const { newContent, appliedCount } = result;
-    if (newContent === content) {
+    const { newContent: normalizedNewContent, appliedCount } = result;
+    if (normalizedNewContent === normalizedContent) {
       return buildConflict("no_change", `Edit made no changes to ${path}.`, currentSnapshotId);
     }
 
+    const newContent = restoreContent(normalizedNewContent, bom, lineEnding);
     await writeFile(absolutePath, path, newContent, signal);
     const newSnapshotId = rememberDocumentSnapshot(absolutePath, newContent);
     invalidateScanCache(absolutePath);
-    const diff = generateDiffString(content, newContent).diff;
+    const diff = generateDiffString(normalizedContent, normalizedNewContent).diff;
 
     return buildAppliedResult(path, appliedCount, newSnapshotId, diff, isStaleSnapshot ? "stale_snapshot_rebased" : undefined);
   });

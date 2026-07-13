@@ -41,7 +41,20 @@ test("executeEdit replaces text copied from read output", async () => {
 
 		const result = await executeEdit(file, snapshotId, [{ oldText: "before\nafter\n", newText: "done\n" }], false, undefined, dir);
 		assert.equal(result.details.status, "applied");
-		assert.equal(await readFile(file, "utf-8"), "done\n");
+		assert.equal(await readFile(file, "utf-8"), "done\r\n");
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeEdit preserves UTF-8 BOM and normalizes replacement line endings", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-bom-unit-"));
+	try {
+		const file = join(dir, "demo.txt");
+		await writeFile(file, "\uFEFFbefore\r\nafter\r\n", "utf-8");
+		const result = await executeEdit(file, undefined, [{ oldText: "before\nafter", newText: "first\nsecond" }], false, undefined, dir);
+		assert.equal(result.details.status, "applied");
+		assert.equal(await readFile(file, "utf-8"), "\uFEFFfirst\r\nsecond\r\n");
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
