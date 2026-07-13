@@ -252,7 +252,7 @@ test("executeEdit returns conflict for not_found in batch edit", async () => {
 	}
 });
 
-test("registerEditTool attaches its lightweight async preview renderer", () => {
+test("registerEditTool attaches custom renderers", () => {
 	let definition: Record<string, unknown> | undefined;
 	registerEditTool({
 		registerTool(def: Record<string, unknown>) {
@@ -265,28 +265,18 @@ test("registerEditTool attaches its lightweight async preview renderer", () => {
 	assert.equal(typeof definition.renderResult, "function");
 });
 
-test("edit preview invalidates after calculating a diff", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-preview-"));
-	try {
-		const file = join(dir, "demo.txt");
-		await writeFile(file, "before\n", "utf-8");
-		let renderCall: ((args: unknown, theme: any, context: any) => unknown) | undefined;
-		registerEditTool({
-			registerTool(def: { renderCall: typeof renderCall }) {
-				renderCall = def.renderCall;
-			},
-		} as any);
-		assert.ok(renderCall);
-		let invalidated = 0;
-		const context = { state: {}, argsComplete: true, cwd: dir, invalidate: () => invalidated++ };
-		const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
-		renderCall!({ path: file, oldText: "before", newText: "after" }, theme, context);
-		await new Promise((resolve) => setTimeout(resolve, 20));
-		assert.equal(invalidated, 1);
-		assert.match((context.state as { preview?: { diff?: string } }).preview?.diff ?? "", /after/);
-	} finally {
-		await rm(dir, { recursive: true, force: true });
-	}
+test("edit call renderer leaves the diff to the result renderer", () => {
+	let renderCall: ((args: unknown, theme: any) => { render(width: number): string[] }) | undefined;
+	registerEditTool({
+		registerTool(def: { renderCall: typeof renderCall }) {
+			renderCall = def.renderCall;
+		},
+	} as any);
+	assert.ok(renderCall);
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+	const output = renderCall!({ path: "demo.txt", oldText: "before", newText: "after" }, theme).render(120).join("\n");
+	assert.match(output, /edit demo\.txt/);
+	assert.doesNotMatch(output, /before|after|Calculating preview/);
 });
 
 test("registerEditTool rejects mixed legacy and batch params", async () => {
