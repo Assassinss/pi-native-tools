@@ -47,6 +47,37 @@ test("executeEdit replaces text copied from read output", async () => {
 	}
 });
 
+test("executeEdit tolerates one extra oldText newline when matching through EOF", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-eof-newline-unit-"));
+	try {
+		const file = join(dir, "demo.txt");
+		await writeFile(file, "first\nlast", "utf-8");
+		const readResult = await executeRead(file, 1, 2, undefined, dir, undefined, undefined, true);
+		const snapshotId = (readResult.details as { snapshotId?: string } | undefined)?.snapshotId;
+		assert.ok(snapshotId);
+
+		const result = await executeEdit(file, snapshotId, [{ oldText: "first\nlast\n", newText: "first\ndone\n" }], false, undefined, dir);
+		assert.equal(result.details.status, "applied");
+		assert.equal(await readFile(file, "utf-8"), "first\ndone\n");
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeEdit does not ignore an extra newline away from EOF", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-internal-newline-unit-"));
+	try {
+		const file = join(dir, "demo.txt");
+		await writeFile(file, "first\nlast suffix", "utf-8");
+		const result = await executeEdit(file, undefined, [{ oldText: "first\nlast\n", newText: "done" }], false, undefined, dir);
+		assert.equal(result.details.status, "conflict");
+		assert.equal(result.details.reason, "not_found");
+		assert.equal(await readFile(file, "utf-8"), "first\nlast suffix");
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
 test("executeEdit preserves UTF-8 BOM and normalizes replacement line endings", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-bom-unit-"));
 	try {

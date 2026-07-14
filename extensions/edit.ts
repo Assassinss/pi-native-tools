@@ -39,7 +39,7 @@ type EditConflictResult = {
 
 const replaceEditSchema = Type.Object(
   {
-    oldText: Type.String({ description: "Exact existing text to replace. Must be unique in the file and non-overlapping with other edits[].oldText." }),
+    oldText: Type.String({ description: "Existing text to replace. Line endings are normalized, and one trailing newline is tolerated when the text otherwise matches through EOF. Must be unique and non-overlapping with other edits[].oldText." }),
     newText: Type.String({ description: "Replacement text for this targeted edit." }),
   },
   { additionalProperties: false },
@@ -57,7 +57,7 @@ const editSchema = Type.Object(
       }),
     ),
     oldText: Type.Optional(
-      Type.String({ description: "Exact existing text to replace (legacy single-edit). Prefer edits[] for batch edits." }),
+      Type.String({ description: "Existing text to replace (legacy single-edit). Line endings and one extra newline at EOF are tolerated. Prefer edits[] for batch edits." }),
     ),
     newText: Type.Optional(
       Type.String({ description: "Replacement text (legacy single-edit). Prefer edits[] for batch edits." }),
@@ -111,7 +111,20 @@ function restoreContent(content: string, bom: string, lineEnding: "\n" | "\r\n")
 
 function findCompatibleMatches(content: string, oldText: string): { oldText: string; matches: number[] } {
   const normalizedOldText = normalizeToLf(oldText);
-  return { oldText: normalizedOldText, matches: findMatchIndices(content, normalizedOldText) };
+  const exactMatches = findMatchIndices(content, normalizedOldText);
+  if (exactMatches.length > 0 || !normalizedOldText.endsWith("\n")) {
+    return { oldText: normalizedOldText, matches: exactMatches };
+  }
+
+  // Read output cannot make a missing final newline visually distinct from its metadata separator.
+  // Tolerate one extra newline only when the remaining text matches exactly through EOF.
+  const withoutFinalNewline = normalizedOldText.slice(0, -1);
+  const eofIndex = content.length - withoutFinalNewline.length;
+  if (withoutFinalNewline.length > 0 && eofIndex >= 0 && content.startsWith(withoutFinalNewline, eofIndex)) {
+    return { oldText: withoutFinalNewline, matches: [eofIndex] };
+  }
+
+  return { oldText: normalizedOldText, matches: [] };
 }
 
 function buildPreview(content: string, index: number, needle: string): string {
