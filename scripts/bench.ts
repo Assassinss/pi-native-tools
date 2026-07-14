@@ -189,7 +189,7 @@ async function benchmarkFindConcurrentBuiltin(root: string, concurrency: number)
 async function benchmarkGrepNative(root: string): Promise<TimedSeries> {
 	return benchmarkSeries(
 		GREP_RUNS,
-		() => executeGrepNative("needle", undefined, undefined, false, false, 0, FILE_COUNT, root, undefined),
+		() => executeGrepNative({ pattern: "needle", context: 0, limit: FILE_COUNT, cwd: root }),
 		root,
 	);
 }
@@ -205,7 +205,7 @@ async function benchmarkGrepBuiltin(root: string): Promise<TimedSeries> {
 async function benchmarkGrepConcurrentNative(root: string, concurrency: number): Promise<ConcurrentSeries> {
 	return benchmarkConcurrentSeries(
 		concurrency,
-		() => executeGrepNative("needle", undefined, undefined, false, false, 0, FILE_COUNT, root, undefined),
+		() => executeGrepNative({ pattern: "needle", context: 0, limit: FILE_COUNT, cwd: root }),
 		root,
 	);
 }

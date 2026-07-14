@@ -6,7 +6,7 @@ import {
 	truncateHead,
 	truncateLine,
 } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
+import { Type, type Static } from "typebox";
 import { GrepOutputMode, grep, type GrepMatch } from "./omp-native.ts";
 import { basename } from "node:path";
 import { stat } from "node:fs/promises";
@@ -21,6 +21,8 @@ const DEFAULT_LIMIT = 100;
 const SEARCH_TIMEOUT_MS = 30_000;
 const MODEL_MAX_BYTES = 16 * 1024;
 const MODEL_MAX_LINES = 500;
+const NOTICE_RESERVE_BYTES = 1024;
+const NOTICE_RESERVE_LINES = 2;
 const MAX_MATCHES_PER_FILE = 8;
 const MAX_MATCH_FILES = 40;
 const MAX_MATCHES = 120;
@@ -47,25 +49,17 @@ const grepSchema = Type.Object(
 	{ additionalProperties: false },
 );
 
-type GrepMode = "content" | "count" | "filesWithMatches";
-type GrepUpdate = { content: Array<{ type: "text"; text: string }>; details?: GrepToolDetails };
+type GrepParams = Static<typeof grepSchema>;
+type GrepMode = NonNullable<GrepParams["mode"]>;
+type GrepUpdate = { content: Array<{ type: "text"; text: string }>; details: GrepToolDetails | undefined };
+
+export interface ExecuteGrepOptions extends GrepParams {
+	cwd: string;
+	signal?: AbortSignal;
+}
 
 function escapeRegex(pattern: string): string {
 	return pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function validateRegexPattern(pattern: string, ignoreCase: boolean | undefined): void {
-	try {
-		new RegExp(pattern, ignoreCase ? "i" : undefined);
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		throw grepError(
-			"invalid_regex",
-			`Invalid regex: ${message}`,
-			"Use literal=true for exact text or fix the regex syntax.",
-			{ pattern, literal: false },
-		);
-	}
 }
 
 function sanitizeLine(line: string): string {
@@ -76,30 +70,27 @@ function formatMatchPath(matchPath: string, isDirectory: boolean, searchPath: st
 	return isDirectory ? matchPath.replace(/\\/g, "/") : basename(searchPath).replace(/\\/g, "/");
 }
 
-function pushMatchBlock(outputLines: string[], pathText: string, match: GrepMatch, contextValue: number): boolean {
-	let linesTruncated = Boolean(match.truncated);
-	if (contextValue <= 0) {
-		const sanitized = sanitizeLine(match.line ?? "");
-		const truncated = truncateLine(sanitized, GREP_MAX_LINE_LENGTH);
-		outputLines.push(`${pathText}:${match.lineNumber}: ${truncated.text}`);
-		return linesTruncated || truncated.wasTruncated;
+type OutputLine = { line: string; isMatch: boolean; nativeTruncated: boolean };
+
+function collectContentLines(matches: GrepMatch[], contextValue: number): Map<string, Map<number, OutputLine>> {
+	const files = new Map<string, Map<number, OutputLine>>();
+	for (const match of matches) {
+		const lines = files.get(match.path) ?? new Map<number, OutputLine>();
+		files.set(match.path, lines);
+		if (contextValue > 0) {
+			for (const contextLine of [...(match.contextBefore ?? []), ...(match.contextAfter ?? [])]) {
+				if (!lines.has(contextLine.lineNumber)) {
+					lines.set(contextLine.lineNumber, { line: contextLine.line, isMatch: false, nativeTruncated: false });
+				}
+			}
+		}
+		lines.set(match.lineNumber, {
+			line: match.line ?? "",
+			isMatch: true,
+			nativeTruncated: Boolean(match.truncated),
+		});
 	}
-	for (const before of match.contextBefore ?? []) {
-		const sanitized = sanitizeLine(before.line);
-		const truncated = truncateLine(sanitized, GREP_MAX_LINE_LENGTH);
-		outputLines.push(`${pathText}-${before.lineNumber}- ${truncated.text}`);
-		linesTruncated = linesTruncated || truncated.wasTruncated;
-	}
-	const matchLine = truncateLine(sanitizeLine(match.line ?? ""), GREP_MAX_LINE_LENGTH);
-	outputLines.push(`${pathText}:${match.lineNumber}: ${matchLine.text}`);
-	linesTruncated = linesTruncated || matchLine.wasTruncated;
-	for (const after of match.contextAfter ?? []) {
-		const sanitized = sanitizeLine(after.line);
-		const truncated = truncateLine(sanitized, GREP_MAX_LINE_LENGTH);
-		outputLines.push(`${pathText}-${after.lineNumber}- ${truncated.text}`);
-		linesTruncated = linesTruncated || truncated.wasTruncated;
-	}
-	return linesTruncated;
+	return files;
 }
 
 function resolveNativeMode(mode: GrepMode | undefined): GrepOutputMode {
@@ -129,9 +120,14 @@ function formatGrepOutput(mode: GrepMode, matches: GrepMatch[], isDirectory: boo
 
 	const outputLines: string[] = [];
 	let linesTruncated = false;
-	for (const match of matches) {
-		const pathText = formatMatchPath(match.path, isDirectory, searchPath);
-		linesTruncated = pushMatchBlock(outputLines, pathText, match, contextValue) || linesTruncated;
+	for (const [matchPath, lines] of collectContentLines(matches, contextValue)) {
+		const pathText = formatMatchPath(matchPath, isDirectory, searchPath);
+		for (const [lineNumber, outputLine] of [...lines].sort(([a], [b]) => a - b)) {
+			const truncated = truncateLine(sanitizeLine(outputLine.line), GREP_MAX_LINE_LENGTH);
+			const separator = outputLine.isMatch ? ":" : "-";
+			outputLines.push(`${pathText}${separator}${lineNumber}${separator} ${truncated.text}`);
+			linesTruncated = linesTruncated || outputLine.nativeTruncated || truncated.wasTruncated;
+		}
 	}
 	return { text: outputLines.join("\n"), linesTruncated };
 }
@@ -168,25 +164,39 @@ function buildGrepResponse(
 	isDirectory: boolean,
 	searchPath: string,
 	contextValue: number,
-	result?: { limitReached?: boolean; skippedOversized?: number },
+	result?: {
+		limitReached?: boolean;
+		skippedOversized?: number;
+		totalMatches?: number;
+		filesWithMatches?: number;
+	},
 	effectiveLimit?: number,
 ): GrepUpdate {
-	if (matches.length === 0) {
-		return { content: [{ type: "text", text: "No matches found" }], details: undefined };
-	}
-
 	const limited = mode === "content" ? limitContentMatches(matches) : { matches, omitted: 0, omittedFiles: 0 };
 	const formatted = formatGrepOutput(mode, limited.matches, isDirectory, searchPath, contextValue);
-	const truncation = truncateHead(formatted.text, { maxBytes: MODEL_MAX_BYTES, maxLines: MODEL_MAX_LINES });
-	let text = truncation.content;
+	const truncation = truncateHead(formatted.text, {
+		maxBytes: MODEL_MAX_BYTES - NOTICE_RESERVE_BYTES,
+		maxLines: MODEL_MAX_LINES - NOTICE_RESERVE_LINES,
+	});
+	let text = truncation.content || "No matches found";
 	const details: GrepToolDetails = {};
 	const notices: string[] = [];
-	if (result?.limitReached && effectiveLimit !== undefined) {
+	const nativeOmitted = mode === "content" ? Math.max(0, (result?.totalMatches ?? matches.length) - matches.length) : 0;
+	const userLimitReached = Boolean(result?.limitReached && effectiveLimit !== undefined && (result?.totalMatches ?? 0) >= effectiveLimit);
+	if (userLimitReached && effectiveLimit !== undefined) {
 		notices.push(formatLimitNotice(mode, effectiveLimit));
 		details.matchLimitReached = effectiveLimit;
 	}
-	if (limited.omitted > 0) {
-		notices.push(`${limited.omitted} matches in ${limited.omittedFiles} files omitted (max ${MAX_MATCHES_PER_FILE}/file, ${MAX_MATCH_FILES} files, ${MAX_MATCHES} matches)`);
+	const omitted = limited.omitted + nativeOmitted;
+	if (omitted > 0) {
+		const matchesPerFile = new Map<string, number>();
+		for (const match of matches) matchesPerFile.set(match.path, (matchesPerFile.get(match.path) ?? 0) + 1);
+		const filesAtPerFileLimit = [...matchesPerFile.values()].filter((count) => count >= MAX_MATCHES_PER_FILE).length;
+		const omittedFiles = Math.max(limited.omittedFiles, filesAtPerFileLimit, result?.filesWithMatches && matches.length === 0 ? result.filesWithMatches : 0);
+		const qualifier = nativeOmitted > 0 ? "At least " : "";
+		const matchLabel = omitted === 1 ? "match" : "matches";
+		const fileLabel = omittedFiles === 1 ? "file" : "files";
+		notices.push(`${qualifier}${omitted} ${matchLabel} in ${omittedFiles} ${fileLabel} omitted (max ${MAX_MATCHES_PER_FILE}/file, ${MAX_MATCH_FILES} files, ${MAX_MATCHES} matches)`);
 	}
 	if (truncation.truncated) {
 		notices.push(`${formatSize(MODEL_MAX_BYTES)} or ${MODEL_MAX_LINES} lines limit reached`);
@@ -203,31 +213,36 @@ function buildGrepResponse(
 	return { content: [{ type: "text", text }], details: Object.keys(details).length > 0 ? details : undefined };
 }
 
-export async function executeGrepNative(
-	pattern: string,
-	searchDir: string | undefined,
-	globPattern: string | undefined,
-	ignoreCase: boolean | undefined,
-	literal: boolean | undefined,
-	context: number | undefined,
-	limit: number | undefined,
-	cwd: string,
-	signal: AbortSignal | undefined,
-	mode: GrepMode | undefined,
-	onUpdate?: (update: GrepUpdate) => void,
-): Promise<{ content: Array<{ type: "text"; text: string }>; details?: GrepToolDetails }> {
+export async function executeGrepNative({
+	pattern,
+	path: searchDir,
+	glob: globPattern,
+	ignoreCase,
+	literal,
+	context,
+	limit,
+	cwd,
+	signal,
+	mode,
+}: ExecuteGrepOptions): Promise<GrepUpdate> {
 	const searchPath = normalizePath(searchDir || ".", cwd);
 	let isDirectory: boolean;
 	try {
 		isDirectory = (await stat(searchPath)).isDirectory();
-	} catch {
-		throw grepError("path_not_found", `Path not found: ${searchPath}`, "Check the search path and retry.", { path: searchPath });
+	} catch (error) {
+		const code = error instanceof Error && "code" in error ? String(error.code) : undefined;
+		if (code === "ENOENT") {
+			throw grepError("path_not_found", `Path not found: ${searchPath}`, "Check the search path and retry.", { path: searchPath });
+		}
+		throw grepError("path_unreadable", `Cannot access path: ${searchPath}`, "Check path permissions and retry.", {
+			path: searchPath,
+			...(code ? { cause: code } : {}),
+		});
 	}
 
 	const grepMode = mode ?? "content";
 	const contextValue = context && context > 0 ? context : 0;
 	const effectiveLimit = Math.max(1, limit ?? DEFAULT_LIMIT);
-	if (!literal) validateRegexPattern(pattern, ignoreCase);
 	const nativePattern = literal ? escapeRegex(pattern) : pattern;
 
 	let result;
@@ -241,6 +256,7 @@ export async function executeGrepNative(
 				hidden: true,
 				gitignore: true,
 				maxCount: effectiveLimit,
+				maxCountPerFile: grepMode === "content" ? MAX_MATCHES_PER_FILE : undefined,
 				contextBefore: contextValue,
 				contextAfter: contextValue,
 				maxColumns: GREP_MAX_LINE_LENGTH,
@@ -248,16 +264,16 @@ export async function executeGrepNative(
 				signal,
 				timeoutMs: SEARCH_TIMEOUT_MS,
 			},
-			(error, match) => {
-				if (error || !match) return;
-			},
 		);
 	} catch (err) {
 		if (err instanceof Error && /^regex(?: parse)? error/i.test(err.message)) {
 			const message = err.message.replace(/^regex(?: parse)? error:?\s*/i, "Invalid regex: ");
 			throw grepError("invalid_regex", message, "Use literal=true for exact text or fix the regex syntax.", { pattern, literal: Boolean(literal) });
 		}
-		if (err instanceof Error && err.message.includes("Aborted: Timeout")) {
+		if (signal?.aborted) {
+			throw grepError("search_aborted", "Search was cancelled", "Retry the search if it is still needed.", { path: searchPath });
+		}
+		if (err instanceof Error && /(?:aborted:\s*)?timeout/i.test(err.message)) {
 			throw grepError(
 				"search_timeout",
 				`Search timed out after ${SEARCH_TIMEOUT_MS / 1000}s; narrow paths or pattern`,
@@ -266,10 +282,6 @@ export async function executeGrepNative(
 			);
 		}
 		throw err;
-	}
-
-	if (result.matches.length === 0) {
-		return { content: [{ type: "text", text: "No matches found" }], details: undefined };
 	}
 
 	return buildGrepResponse(grepMode, result.matches, isDirectory, searchPath, contextValue, result, effectiveLimit);
@@ -289,35 +301,12 @@ export function registerGrepTool(pi: ExtensionAPI): void {
 			"Read returned files for full context instead of repeatedly grepping them.",
 		],
 		parameters: grepSchema,
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const raw = params as {
-				pattern: string;
-				path?: string;
-				glob?: string;
-				ignoreCase?: boolean;
-				literal?: boolean;
-				context?: number;
-				limit?: number;
-				mode?: GrepMode;
-				output_mode?: GrepMode;
-				outputMode?: GrepMode;
-			};
-			const { pattern, path: searchDir, glob, ignoreCase, literal, context, limit } = raw;
-			// ponytail: map common parameter name variations to mode
-			const mode = raw.mode ?? raw.output_mode ?? raw.outputMode;
-			return executeGrepNative(
-				pattern,
-				searchDir,
-				glob,
-				ignoreCase,
-				literal,
-				context,
-				limit,
-				ctx?.cwd ?? process.cwd(),
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			return executeGrepNative({
+				...(params as GrepParams),
+				cwd: ctx?.cwd ?? process.cwd(),
 				signal,
-				mode,
-				onUpdate as any,
-			);
+			});
 		},
 	});
 }

@@ -473,6 +473,8 @@ export function registerBashTool(pi: ExtensionAPI): void {
 			"Use bash to execute shell commands, scripts, builds, tests, git operations, and environment inspection.",
 			"Prefer focused commands with concise output; reduce verbose success logs while preserving warnings and failure details.",
 			"Set an appropriate timeout for commands that may block or run for a long time.",
+			"Run bash commands sequentially by default: wait for one command to finish before starting another in the same cwd.",
+			"Do not launch parallel bash calls that share the persistent session; they can fail with session_busy. If parallel execution is necessary, set session=false on every concurrent call.",
 			"Bash sessions persist per cwd, including directory and environment changes; use session=false for isolation or resetSession=true for a clean session.",
 		],
 		parameters: bashSchema,

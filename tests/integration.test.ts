@@ -252,7 +252,78 @@ test("registered native grep limits repetitive matches per file", async () => {
 		const result = await grep!.execute("2", { pattern: "needle", path: dir }, undefined, undefined, { cwd: dir });
 		const text = extractText(result);
 		assert.equal((text.match(/many\.ts:\d+: needle/g) ?? []).length, 8);
-		assert.match(text, /2 matches in 1 files omitted/);
+		assert.match(text, /At least 1 match in 1 file omitted/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("registered native grep accepts native regex syntax and literal metacharacters", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-native-grep-regex-"));
+	try {
+		const pi = createPiStub();
+		extension(pi as any);
+		const grep = pi.tools.get("grep");
+		assert.ok(grep);
+		await writeFile(join(dir, "patterns.txt"), "Needle\n()[]?.*\n", "utf-8");
+
+		const regexResult = await grep!.execute("1", { pattern: "(?i)needle", path: dir }, undefined, undefined, { cwd: dir });
+		assert.match(extractText(regexResult), /Needle/);
+		const literalResult = await grep!.execute("2", { pattern: "()[]?.*", path: dir, literal: true }, undefined, undefined, { cwd: dir });
+		assert.match(extractText(literalResult), /\(\)\[\]\?\.\*/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("registered native grep distributes matches across files", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-native-grep-distributed-"));
+	try {
+		const pi = createPiStub();
+		extension(pi as any);
+		const grep = pi.tools.get("grep");
+		assert.ok(grep);
+		await writeFile(join(dir, "a.ts"), Array(50).fill("needle").join("\n"), "utf-8");
+		await writeFile(join(dir, "b.ts"), "needle\n", "utf-8");
+
+		const result = await grep!.execute("1", { pattern: "needle", path: dir, limit: 20 }, undefined, undefined, { cwd: dir });
+		const text = extractText(result);
+		assert.match(text, /a\.ts:1: needle/);
+		assert.match(text, /b\.ts:1: needle/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("registered native grep de-duplicates overlapping context lines", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-native-grep-context-"));
+	try {
+		const pi = createPiStub();
+		extension(pi as any);
+		const grep = pi.tools.get("grep");
+		assert.ok(grep);
+		await writeFile(join(dir, "context.ts"), "before\nneedle one\nneedle two\nafter\n", "utf-8");
+
+		const result = await grep!.execute("1", { pattern: "needle", path: dir, context: 1 }, undefined, undefined, { cwd: dir });
+		const text = extractText(result);
+		assert.equal((text.match(/context\.ts:2: needle one/g) ?? []).length, 1);
+		assert.equal((text.match(/context\.ts:3: needle two/g) ?? []).length, 1);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("registered native grep reports missing paths with a structured code", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-native-grep-errors-"));
+	try {
+		const pi = createPiStub();
+		extension(pi as any);
+		const grep = pi.tools.get("grep");
+		assert.ok(grep);
+		await assert.rejects(
+			grep!.execute("1", { pattern: "needle", path: join(dir, "missing") }, undefined, undefined, { cwd: dir }),
+			/path_not_found/,
+		);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
