@@ -7,17 +7,17 @@ import {
 	type TruncationResult,
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
+import { Type, type Static } from "typebox";
 import { executeShell, Shell, type ShellRunResult } from "./omp-native.ts";
 import { randomBytes } from "node:crypto";
-import { constants, createWriteStream } from "node:fs";
-import { access, realpath } from "node:fs/promises";
+import { createWriteStream } from "node:fs";
+import { realpath, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { toolError } from "./shared.ts";
 
 function bashError(code: string, message: string, hint?: string, details?: Record<string, unknown>): Error {
-	return toolError({ tool: "bash", code, message, hint, details, retryable: code !== "command_failed" });
+	return toolError({ tool: "bash", code, message, hint, details, retryable: code === "aborted" || code === "timeout" || code === "session_busy" });
 }
 
 type TextContent = { type: "text"; text: string };
@@ -43,6 +43,8 @@ const bashSchema = Type.Object(
 	},
 	{ additionalProperties: false },
 );
+type BashInput = Static<typeof bashSchema>;
+
 const MODEL_MAX_BYTES = 16 * 1024;
 const MODEL_MAX_LINES = 500;
 const shellSessions = new Map<string, Shell>();
@@ -90,6 +92,7 @@ class OutputAccumulator {
 	private finished = false;
 	private tempFilePath?: string;
 	private tempFileStream?: ReturnType<typeof createWriteStream>;
+	private tempFileError?: Error;
 
 	append(text: string): void {
 		if (this.finished) throw new Error("Cannot append to a finished output accumulator");
@@ -137,22 +140,34 @@ class OutputAccumulator {
 	}
 
 	async closeTempFile(): Promise<void> {
-		if (!this.tempFileStream) return;
+		if (!this.tempFileStream) {
+			if (this.tempFileError) throw this.tempFileError;
+			return;
+		}
 		const stream = this.tempFileStream;
 		this.tempFileStream = undefined;
+		if (this.tempFileError || stream.destroyed) {
+			stream.destroy();
+			throw this.tempFileError ?? new Error(`Failed to write full command output to ${this.tempFilePath}`);
+		}
 		await new Promise<void>((resolve, reject) => {
-			const onError = (error: Error) => {
+			const cleanup = () => {
+				stream.off("error", onError);
 				stream.off("finish", onFinish);
+			};
+			const onError = (error: Error) => {
+				cleanup();
 				reject(error);
 			};
 			const onFinish = () => {
-				stream.off("error", onError);
+				cleanup();
 				resolve();
 			};
 			stream.once("error", onError);
 			stream.once("finish", onFinish);
 			stream.end();
 		});
+		if (this.tempFileError) throw this.tempFileError;
 	}
 
 	private appendDecodedText(text: string): void {
@@ -207,7 +222,10 @@ class OutputAccumulator {
 	private ensureTempFile(): void {
 		if (this.tempFilePath) return;
 		this.tempFilePath = defaultTempFilePath(this.tempFilePrefix);
-		this.tempFileStream = createWriteStream(this.tempFilePath);
+		this.tempFileStream = createWriteStream(this.tempFilePath, { mode: 0o600 });
+		this.tempFileStream.on("error", (error) => {
+			this.tempFileError ??= error;
+		});
 		for (const chunk of this.rawChunks) this.tempFileStream.write(chunk);
 		this.rawChunks.length = 0;
 	}
@@ -234,12 +252,13 @@ function clearShellSessionEviction(sessionKey: string): void {
 	clearTimeout(timer);
 }
 
-function disposeShellSession(sessionKey: string): void {
+async function disposeShellSession(sessionKey: string): Promise<void> {
 	const shell = shellSessions.get(sessionKey);
 	clearShellSessionEviction(sessionKey);
 	shellSessions.delete(sessionKey);
 	shellSessionsInitialized.delete(sessionKey);
-	if (shell) void shell.abort().catch(() => undefined);
+	shellSessionsInUse.delete(sessionKey);
+	if (shell) await shell.abort().catch(() => undefined);
 }
 
 function scheduleShellSessionEviction(sessionKey: string): void {
@@ -249,7 +268,7 @@ function scheduleShellSessionEviction(sessionKey: string): void {
 	const timer = setTimeout(() => {
 		shellSessionEvictionTimers.delete(sessionKey);
 		if (shellSessionsInUse.has(sessionKey)) return;
-		disposeShellSession(sessionKey);
+		void disposeShellSession(sessionKey);
 	}, idleMs);
 	timer.unref?.();
 	shellSessionEvictionTimers.set(sessionKey, timer);
@@ -259,8 +278,8 @@ export function getBashSessionCount(): number {
 	return shellSessions.size;
 }
 
-export function clearBashSessions(): void {
-	for (const sessionKey of shellSessions.keys()) disposeShellSession(sessionKey);
+export async function clearBashSessions(): Promise<void> {
+	await Promise.all([...shellSessions.keys()].map(disposeShellSession));
 }
 
 function formatOutput(snapshot: OutputSnapshot, emptyText = "(no output)"): { text: string; details?: BashToolDetails } {
@@ -283,12 +302,17 @@ function formatOutput(snapshot: OutputSnapshot, emptyText = "(no output)"): { te
 }
 
 async function resolveShellCwd(cwd: string): Promise<string> {
+	let resolvedCwd: string;
 	try {
-		await access(cwd, constants.F_OK);
-		return await realpath(cwd);
-	} catch {
-		throw new Error(`Working directory does not exist: ${cwd}\nCannot execute bash commands.`);
+		resolvedCwd = await realpath(cwd);
+	} catch (error) {
+		const reason = error instanceof Error ? error.message : String(error);
+		throw bashError("invalid_cwd", `Cannot access working directory: ${cwd}`, undefined, { cwd, reason });
 	}
+	if (!(await stat(resolvedCwd)).isDirectory()) {
+		throw bashError("invalid_cwd", `Working directory is not a directory: ${cwd}`, undefined, { cwd: resolvedCwd });
+	}
+	return resolvedCwd;
 }
 
 function buildSessionKey(cwd: string): string {
@@ -305,12 +329,19 @@ export async function executeBashNative(
 ): Promise<{ content: TextContent[]; details?: BashToolDetails }> {
 	const resolvedCwd = await resolveShellCwd(cwd);
 	const sessionKey = buildSessionKey(resolvedCwd);
-	if (options?.resetSession) disposeShellSession(sessionKey);
-
 	const useSession = options?.session !== false;
-	const sessionBusy = useSession && shellSessionsInUse.has(sessionKey);
-	let shell = useSession && !sessionBusy ? shellSessions.get(sessionKey) : undefined;
-	if (!shell && useSession && !sessionBusy) {
+	if ((useSession || options?.resetSession) && shellSessionsInUse.has(sessionKey)) {
+		throw bashError(
+			"session_busy",
+			`The persistent shell session is already running a command for ${resolvedCwd}`,
+			"Wait for it to finish, or retry with session=false for an isolated shell.",
+			{ cwd: resolvedCwd },
+		);
+	}
+	if (options?.resetSession) await disposeShellSession(sessionKey);
+
+	let shell = useSession ? shellSessions.get(sessionKey) : undefined;
+	if (!shell && useSession) {
 		shell = new Shell();
 		shellSessions.set(sessionKey, shell);
 	}
@@ -327,6 +358,8 @@ export async function executeBashNative(
 
 	let lastUpdateAt = 0;
 	let pendingUpdateTimer: ReturnType<typeof setTimeout> | undefined;
+	let acceptingOutput = true;
+	let sessionReusable = true;
 	const flushUpdate = () => {
 		pendingUpdateTimer = undefined;
 		if (!onUpdate) return;
@@ -358,8 +391,7 @@ export async function executeBashNative(
 		onUpdate?.({ content: [], details: undefined });
 		if (shell) shellSessionsInUse.add(sessionKey);
 		const callback = (error: Error | null, chunk: string | null) => {
-			if (error) return;
-			if (!chunk) return;
+			if (!acceptingOutput || error || !chunk) return;
 			accumulator.append(chunk);
 			emitUpdate();
 		};
@@ -376,6 +408,8 @@ export async function executeBashNative(
 		try {
 			result = await runPromise;
 		} catch (err) {
+			sessionReusable = false;
+			acceptingOutput = false;
 			accumulator.finish();
 			const snapshot = accumulator.snapshot();
 			await accumulator.closeTempFile();
@@ -386,7 +420,9 @@ export async function executeBashNative(
 			if (err instanceof Error) throw bashError("execution_failed", appendStatus(text, err.message), undefined, { cwd: resolvedCwd });
 			throw err;
 		}
-		if (shell && !result.cancelled && !result.timedOut) shellSessionsInitialized.add(sessionKey);
+		if (result.cancelled || result.timedOut) sessionReusable = false;
+		if (shell && sessionReusable) shellSessionsInitialized.add(sessionKey);
+		acceptingOutput = false;
 		accumulator.finish();
 		const snapshot = accumulator.snapshot();
 		await accumulator.closeTempFile();
@@ -415,8 +451,8 @@ export async function executeBashNative(
 		signal?.removeEventListener("abort", relayAbort);
 		if (pendingUpdateTimer) clearTimeout(pendingUpdateTimer);
 		if (shell) shellSessionsInUse.delete(sessionKey);
-		if (controller.signal.aborted && shell) {
-			disposeShellSession(sessionKey);
+		if (shell && (!sessionReusable || controller.signal.aborted)) {
+			await disposeShellSession(sessionKey);
 		} else if (shell) {
 			scheduleShellSessionEviction(sessionKey);
 		}
@@ -424,26 +460,24 @@ export async function executeBashNative(
 }
 
 export function registerBashTool(pi: ExtensionAPI): void {
+	pi.on("session_shutdown", async () => {
+		await clearBashSessions();
+	});
+
 	pi.registerTool({
 		...builtInBash,
 		description:
 			"Execute shell commands in the current working directory. Use this for build, test, run, git, and other shell-specific tasks. Do not use it for routine file reading or code search when read, find, or grep can answer more directly. Output is truncated and full output is retrievable via the artifact system.",
 		promptSnippet: "Run shell commands",
 		promptGuidelines: [
-			"Use bash only for shell-dependent work such as builds, tests, git, or environment inspection.",
-			"Use read, find, grep, write, or edit for file operations and searches.",
-			"Prefer commands with concise output; filter verbose success logs and preserve failure details.",
-			"Set timeout for commands that may run for a long time.",
-			"Sessions persist per cwd; use session=false for isolation or resetSession=true to discard state.",
+			"Use bash to execute shell commands, scripts, builds, tests, git operations, and environment inspection.",
+			"Prefer focused commands with concise output; reduce verbose success logs while preserving warnings and failure details.",
+			"Set an appropriate timeout for commands that may block or run for a long time.",
+			"Bash sessions persist per cwd, including directory and environment changes; use session=false for isolation or resetSession=true for a clean session.",
 		],
 		parameters: bashSchema,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const { command, timeout, session, resetSession } = params as {
-				command: string;
-				timeout?: number;
-				session?: boolean;
-				resetSession?: boolean;
-			};
+			const { command, timeout, session, resetSession } = params as BashInput;
 			return executeBashNative(command, ctx?.cwd ?? process.cwd(), timeout, signal, onUpdate as any, { session, resetSession });
 		},
 	});

@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { STREAMING_THRESHOLD, STREAM_READ_CHUNK_SIZE } from "../extensions/shared.ts";
+import { clearBashSessions, getBashSessionCount } from "../extensions/bash.ts";
 import extension from "../index.ts";
 
 type ToolDef = {
@@ -19,11 +20,19 @@ type ToolDef = {
 
 function createPiStub() {
 	const tools = new Map<string, ToolDef>();
+	const events = new Map<string, Array<(...args: any[]) => unknown>>();
 	return {
 		registerTool(def: ToolDef) {
 			tools.set(def.name, def);
 		},
-		on(_event: string, _handler: unknown) {},
+		on(event: string, handler: (...args: any[]) => unknown) {
+			const handlers = events.get(event) ?? [];
+			handlers.push(handler);
+			events.set(event, handlers);
+		},
+		async emit(event: string, ...args: any[]) {
+			await Promise.all((events.get(event) ?? []).map((handler) => handler(...args)));
+		},
 		tools,
 	};
 }
@@ -336,6 +345,93 @@ test("registered native bash supports session controls", async () => {
 		const reset = await bash!.execute("4", { command: "pwd", resetSession: true }, undefined, undefined, { cwd: dir });
 		assert.equal(await realpath(extractText(reset).trim()), await realpath(dir));
 	} finally {
+		await clearBashSessions();
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("registered native bash rejects concurrent use of a persistent session", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-native-bash-busy-"));
+	try {
+		const pi = createPiStub();
+		extension(pi as any);
+		const bash = pi.tools.get("bash");
+		assert.ok(bash);
+
+		let started!: () => void;
+		const startedPromise = new Promise<void>((resolve) => {
+			started = resolve;
+		});
+		const running = bash!.execute("1", { command: "sleep 1" }, undefined, () => started(), { cwd: dir });
+		await startedPromise;
+
+		await assert.rejects(
+			bash!.execute("2", { command: "pwd" }, undefined, undefined, { cwd: dir }),
+			/"code":"session_busy"/,
+		);
+		await running;
+	} finally {
+		await clearBashSessions();
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("registered native bash discards a timed-out persistent session", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-native-bash-timeout-"));
+	try {
+		const pi = createPiStub();
+		extension(pi as any);
+		const bash = pi.tools.get("bash");
+		assert.ok(bash);
+
+		await assert.rejects(
+			bash!.execute("1", { command: "sleep 1", timeout: 0.05 }, undefined, undefined, { cwd: dir }),
+			/"code":"timeout"/,
+		);
+		assert.equal(getBashSessionCount(), 0);
+
+		const next = await bash!.execute("2", { command: "pwd" }, undefined, undefined, { cwd: dir });
+		assert.equal(await realpath(extractText(next).trim()), await realpath(dir));
+	} finally {
+		await clearBashSessions();
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("registered native bash clears persistent sessions on shutdown", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-native-bash-shutdown-"));
+	try {
+		const pi = createPiStub();
+		extension(pi as any);
+		const bash = pi.tools.get("bash");
+		assert.ok(bash);
+
+		await bash!.execute("1", { command: "pwd" }, undefined, undefined, { cwd: dir });
+		assert.ok(getBashSessionCount() > 0);
+		await pi.emit("session_shutdown");
+		assert.equal(getBashSessionCount(), 0);
+	} finally {
+		await clearBashSessions();
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("registered native bash rejects a file as cwd", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-native-bash-cwd-"));
+	try {
+		const pi = createPiStub();
+		extension(pi as any);
+		const bash = pi.tools.get("bash");
+		assert.ok(bash);
+		const file = join(dir, "not-a-directory.txt");
+		await writeFile(file, "content", "utf-8");
+
+		await assert.rejects(
+			bash!.execute("1", { command: "pwd" }, undefined, undefined, { cwd: file }),
+			/Working directory is not a directory/,
+		);
+	} finally {
+		await clearBashSessions();
 		await rm(dir, { recursive: true, force: true });
 	}
 });
