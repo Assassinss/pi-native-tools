@@ -2,11 +2,12 @@ import { type ExtensionAPI, generateDiffString } from "@earendil-works/pi-coding
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
+  createRevisionId,
   dirname,
   fsWriteFile,
   normalizePath,
   readFile,
-  rememberDocumentSnapshot,
+  rememberDocumentRevision,
   throwIfAborted,
   toolError,
   withFileMutationQueue,
@@ -377,7 +378,7 @@ export async function executeEdit(
       throw editError("read_failed", `Cannot access file: ${path}. Error: ${nodeErr.message}`, undefined, { path });
     }
 
-    const currentSnapshotId = rememberDocumentSnapshot(absolutePath, content);
+    const currentSnapshotId = rememberDocumentRevision(absolutePath, createRevisionId(content));
     const isStaleSnapshot = snapshotId !== undefined && snapshotId !== currentSnapshotId;
     if (isStaleSnapshot && staleSnapshot === "reject") {
       return buildConflict(
@@ -402,7 +403,7 @@ export async function executeEdit(
 
     const newContent = restoreContent(normalizedNewContent, bom, lineEnding);
     await writeFile(absolutePath, path, newContent, signal);
-    const newSnapshotId = rememberDocumentSnapshot(absolutePath, newContent);
+    const newSnapshotId = rememberDocumentRevision(absolutePath, createRevisionId(newContent));
     invalidateScanCache(absolutePath);
     const diff = generateDiffString(normalizedContent, normalizedNewContent).diff;
 

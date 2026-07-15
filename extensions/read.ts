@@ -2,24 +2,19 @@ import { convertToPng, formatDimensionNote, resizeImage, type ExtensionAPI, type
 import type { ImageContent } from "@earendil-works/pi-ai";
 import type { TextContent } from "./shared.ts";
 import { open } from "node:fs/promises";
-import { StringDecoder } from "node:string_decoder";
 import { basename, extname } from "node:path";
 import { Type } from "typebox";
 import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
-	STREAMING_THRESHOLD,
-	STREAM_READ_CHUNK_SIZE,
-	createReadStream,
+	createRevisionId,
 	createStatRevisionId,
 	formatSize,
 	getCurrentDocumentRevision,
-	getDocumentMtime,
-	getDocumentSnapshot,
+	getDocumentFingerprint,
 	normalizePath,
 	readFile,
-	rememberDocumentSnapshot,
-	splitContentLines,
+	rememberDocumentRevision,
 	stat,
 	throwIfAborted,
 	truncateHead,
@@ -62,7 +57,12 @@ type CollectedReadRangeBlock = {
 
 type ReadDetails = ReadToolDetails & { snapshotId?: string };
 
+const MAX_TEXT_FILE_BYTES = 20 * 1024 * 1024;
+const MAX_IMAGE_FILE_BYTES = 20 * 1024 * 1024;
+
 type OutlineEntry = { lineNumber: number; line: string };
+type OutlineResult = { entries: OutlineEntry[]; totalEntries: number; truncated: boolean };
+type CollectionBudget = { lines: number; characters: number; exhausted: boolean };
 
 // ponytail: regex-based outline patterns, upgrade to tree-sitter if precision matters
 const OUTLINE_PATTERNS: Record<string, RegExp[]> = {
@@ -97,24 +97,69 @@ function getOutlinePatterns(filePath: string): RegExp[] {
 	return OUTLINE_PATTERNS[ext] ?? [GENERIC_OUTLINE_PATTERN];
 }
 
-function buildOutline(allLines: string[], filePath: string): OutlineEntry[] {
-	const patterns = getOutlinePatterns(filePath);
-	const entries: OutlineEntry[] = [];
-	for (let i = 0; i < allLines.length; i++) {
-		const line = allLines[i]!;
-		if (line.length === 0) continue;
-		if (patterns.some((p) => p.test(line))) {
-			entries.push({ lineNumber: i + 1, line: line.trim() });
+function forEachContentLine(content: string, visit: (line: string, lineNumber: number) => void): number {
+	if (content.length === 0) return 0;
+	let lineNumber = 1;
+	let start = 0;
+	while (true) {
+		const newline = content.indexOf("\n", start);
+		if (newline === -1) {
+			visit(content.slice(start), lineNumber);
+			return lineNumber;
+		}
+		visit(content.slice(start, newline), lineNumber++);
+		start = newline + 1;
+		if (start === content.length) {
+			visit("", lineNumber);
+			return lineNumber;
 		}
 	}
-	return entries;
 }
 
-function formatOutline(entries: OutlineEntry[], filePath: string): string {
+function createCollectionBudget(): CollectionBudget {
+	return { lines: 0, characters: 0, exhausted: false };
+}
+
+function truncateTextSafely(text: string, maxCharacters: number): string {
+	let end = Math.min(text.length, maxCharacters);
+	if (end > 0 && /[\uD800-\uDBFF]/.test(text[end - 1]!)) end--;
+	return text.slice(0, end);
+}
+
+function collectBoundedLine<T>(items: T[], item: T, text: string, budget: CollectionBudget): void {
+	if (budget.exhausted) return;
+	const remainingCharacters = DEFAULT_MAX_BYTES + 1 - budget.characters;
+	if (budget.lines >= DEFAULT_MAX_LINES + 1 || remainingCharacters <= 0) {
+		budget.exhausted = true;
+		return;
+	}
+	const boundedText = truncateTextSafely(text, remainingCharacters);
+	items.push(typeof item === "string" ? boundedText as T : { ...(item as object), line: boundedText } as T);
+	budget.lines++;
+	budget.characters += boundedText.length + 1;
+	if (boundedText.length < text.length) budget.exhausted = true;
+}
+
+function buildOutline(content: string, filePath: string): OutlineResult {
+	const patterns = getOutlinePatterns(filePath);
+	const entries: OutlineEntry[] = [];
+	const budget = createCollectionBudget();
+	let totalEntries = 0;
+	forEachContentLine(content, (line, lineNumber) => {
+		if (line.length === 0 || !patterns.some((pattern) => pattern.test(line))) return;
+		totalEntries++;
+		const trimmed = line.trim();
+		collectBoundedLine(entries, { lineNumber, line: trimmed }, trimmed, budget);
+	});
+	return { entries, totalEntries, truncated: budget.exhausted || entries.length < totalEntries };
+}
+
+function formatOutline(outline: OutlineResult, filePath: string): string {
 	const name = basename(filePath);
-	const header = `[outline for ${name} — ${entries.length} declaration${entries.length === 1 ? "" : "s"}]`;
-	if (entries.length === 0) return header;
-	return `${header}\n${entries.map((e) => `${e.lineNumber}: ${e.line}`).join("\n")}`;
+	const header = `[outline for ${name} — ${outline.totalEntries} declaration${outline.totalEntries === 1 ? "" : "s"}]`;
+	const body = outline.entries.map((entry) => `${entry.lineNumber}: ${entry.line}`).join("\n");
+	const notice = outline.truncated ? "\n\n[Outline truncated. Use ranges to inspect specific declarations.]" : "";
+	return `${header}${body ? `\n${body}` : ""}${notice}`;
 }
 
 const readRangeSchema = Type.Object({
@@ -169,16 +214,16 @@ async function readImageHeader(path: string): Promise<Buffer> {
 }
 
 async function prepareImage(image: Buffer, mimeType: string): Promise<{ data: string; mimeType: string; note?: string } | undefined> {
-	let data = image.toString("base64");
+	let normalizedImage = image;
 	let normalizedMimeType = mimeType;
 	if (mimeType === "image/bmp") {
-		const converted = await convertToPng(data, mimeType);
+		const converted = await convertToPng(image.toString("base64"), mimeType);
 		if (!converted) return undefined;
-		data = converted.data;
+		normalizedImage = Buffer.from(converted.data, "base64");
 		normalizedMimeType = converted.mimeType;
 	}
 
-	const resized = await resizeImage(Buffer.from(data, "base64"), normalizedMimeType);
+	const resized = await resizeImage(normalizedImage, normalizedMimeType);
 	if (!resized) return undefined;
 	return { data: resized.data, mimeType: resized.mimeType, note: formatDimensionNote(resized) };
 }
@@ -238,9 +283,8 @@ function validateReadArguments(
 	offset: number | undefined,
 	limit: number | undefined,
 	ranges: ReadRangeRequest[] | undefined,
-	outline: boolean | undefined,
+	_outline: boolean | undefined,
 ): void {
-	if (outline) return;
 	if (!ranges || ranges.length === 0) return;
 	if (offset !== undefined || limit !== undefined) {
 		throw readError(
@@ -369,196 +413,30 @@ function finalizeRangeReadResult(
 	return { content: [{ type: "text", text: buildReadResponseText(response.text, snapshotId) }], details: response.details };
 }
 
-function buildRangeBlocksFromLines(allLines: string[], ranges: NormalizedReadRange[], totalLines: number): CollectedReadRangeBlock[] {
-	const mergedBlocks = mergeReadRangeBlocks(ranges, totalLines);
-	const blocks = createCollectedRangeBlocks(mergedBlocks);
-	for (const block of blocks) {
-		block.lines = allLines.slice(block.requestedDisplayStart - 1, block.requestedDisplayEnd).map((line, index) => ({
-			lineNumber: block.requestedDisplayStart + index,
-			line,
-		}));
-	}
+function buildRangeBlocksFromContent(content: string, ranges: NormalizedReadRange[], totalLines: number): CollectedReadRangeBlock[] {
+	const blocks = createCollectedRangeBlocks(mergeReadRangeBlocks(ranges, totalLines));
+	const budget = createCollectionBudget();
+	let blockIndex = 0;
+	forEachContentLine(content, (line, lineNumber) => {
+		while (blockIndex < blocks.length && lineNumber > blocks[blockIndex]!.requestedDisplayEnd) blockIndex++;
+		const block = blocks[blockIndex];
+		if (block && lineNumber >= block.requestedDisplayStart) collectBoundedLine(block.lines, { lineNumber, line }, line, budget);
+	});
 	return blocks;
 }
 
-export async function executeReadStreaming(
-	absolutePath: string,
-	originalPath: string,
-	offset: number | undefined,
-	limit: number | undefined,
-	signal: AbortSignal | undefined,
-	snapshotId: string,
-): Promise<{ content: TextContent[]; details: ReadDetails | undefined }> {
-	const startLine = offset ? Math.max(0, offset - 1) : 0;
-	const endLineExclusive = limit !== undefined ? startLine + limit : Number.POSITIVE_INFINITY;
-
-	return new Promise((resolve, reject) => {
-		if (signal?.aborted) {
-			reject(readError("aborted", "Operation aborted", "Retry the read if cancellation was unintended.", { path: originalPath }));
-			return;
-		}
-
-		const readStream = createReadStream(absolutePath, { highWaterMark: STREAM_READ_CHUNK_SIZE });
-		const decoder = new StringDecoder("utf8");
-		const selectedLines: string[] = [];
-		let sawAnyBytes = false;
-		let nextLineNumber = 1;
-		let buffer = "";
-		let resolved = false;
-
-		function finish() {
-			if (resolved) return;
-			resolved = true;
-			signal?.removeEventListener("abort", onAbort);
-			buffer += decoder.end();
-			if (buffer.length > 0) {
-				handleLine(buffer, nextLineNumber);
-				nextLineNumber++;
-			} else if (sawAnyBytes) {
-				handleLine("", nextLineNumber);
-				nextLineNumber++;
-			}
-
-			const totalLines = nextLineNumber - 1;
-			if (offset !== undefined && startLine >= totalLines) {
-				resolve(buildOffsetOutOfRangeResult(offset, totalLines, snapshotId));
-				return;
-			}
-
-			resolve(finalizeContiguousReadResult(selectedLines.join("\n"), snapshotId, startLine, totalLines, limit));
-		}
-
-		const onAbort = () => {
-			readStream.destroy();
-			reject(readError("aborted", "Operation aborted", "Retry the read if cancellation was unintended.", { path: originalPath }));
-		};
-		signal?.addEventListener("abort", onAbort, { once: true });
-
-		const handleLine = (line: string, lineNumber: number) => {
-			if (lineNumber > startLine && lineNumber <= endLineExclusive) selectedLines.push(line);
-		};
-
-		readStream.on("data", (chunk: Buffer) => {
-			try {
-				detectBinaryContent(chunk, originalPath);
-				sawAnyBytes = true;
-				buffer += decoder.write(chunk);
-				let newlineIdx: number;
-				while ((newlineIdx = buffer.indexOf("\n")) !== -1) {
-					const line = buffer.slice(0, newlineIdx);
-					buffer = buffer.slice(newlineIdx + 1);
-					handleLine(line, nextLineNumber);
-					nextLineNumber++;
-				}
-				// ponytail: early-stop when we've passed requested window with a bounded limit
-				if (limit !== undefined && nextLineNumber > endLineExclusive) {
-					readStream.destroy();
-					finish();
-				}
-			} catch (err) {
-				readStream.destroy();
-				reject(err as Error);
-			}
-		});
-
-		readStream.on("end", () => {
-			finish();
-		});
-
-		readStream.on("error", (err) => {
-			signal?.removeEventListener("abort", onAbort);
-			reject(readError("stream_read_failed", `Stream error reading ${originalPath}: ${err.message}`, undefined, { path: originalPath }));
-		});
+function selectContiguousContent(content: string, startLine: number, limit: number | undefined): { text: string; totalLines: number } {
+	const selected: string[] = [];
+	const budget = createCollectionBudget();
+	const endLine = limit === undefined ? Number.POSITIVE_INFINITY : startLine + limit;
+	const totalLines = forEachContentLine(content, (line, lineNumber) => {
+		if (lineNumber > startLine && lineNumber <= endLine) collectBoundedLine(selected, line, line, budget);
 	});
+	return { text: selected.join("\n"), totalLines };
 }
 
-async function executeReadRangesStreaming(
-	absolutePath: string,
-	originalPath: string,
-	ranges: NormalizedReadRange[],
-	signal: AbortSignal | undefined,
-	snapshotId: string,
-): Promise<{ content: TextContent[]; details: ReadDetails | undefined }> {
-	const mergedBlocks = mergeReadRangeBlocks(ranges);
-	const collectedBlocks = createCollectedRangeBlocks(mergedBlocks);
-	const lastRequestedEnd = mergedBlocks.length > 0 ? mergedBlocks[mergedBlocks.length - 1]!.displayEnd : 0;
-
-	return new Promise((resolve, reject) => {
-		if (signal?.aborted) {
-			reject(readError("aborted", "Operation aborted", "Retry the read if cancellation was unintended.", { path: originalPath }));
-			return;
-		}
-
-		const readStream = createReadStream(absolutePath, { highWaterMark: STREAM_READ_CHUNK_SIZE });
-		const decoder = new StringDecoder("utf8");
-		let sawAnyBytes = false;
-		let nextLineNumber = 1;
-		let buffer = "";
-		let currentBlockIndex = 0;
-		let resolved = false;
-
-		function finish() {
-			if (resolved) return;
-			resolved = true;
-			signal?.removeEventListener("abort", onAbort);
-			buffer += decoder.end();
-			if (buffer.length > 0) {
-				handleLine(buffer, nextLineNumber);
-				nextLineNumber++;
-			} else if (sawAnyBytes) {
-				handleLine("", nextLineNumber);
-				nextLineNumber++;
-			}
-
-			const totalLines = nextLineNumber - 1;
-			resolve(finalizeRangeReadResult(collectedBlocks, ranges, totalLines, snapshotId));
-		}
-
-		const onAbort = () => {
-			readStream.destroy();
-			reject(readError("aborted", "Operation aborted", "Retry the read if cancellation was unintended.", { path: originalPath }));
-		};
-		signal?.addEventListener("abort", onAbort, { once: true });
-
-		const handleLine = (line: string, lineNumber: number) => {
-			while (currentBlockIndex < collectedBlocks.length && lineNumber > collectedBlocks[currentBlockIndex]!.requestedDisplayEnd) currentBlockIndex++;
-			if (currentBlockIndex >= collectedBlocks.length) return;
-			const block = collectedBlocks[currentBlockIndex]!;
-			if (lineNumber >= block.requestedDisplayStart && lineNumber <= block.requestedDisplayEnd) block.lines.push({ lineNumber, line });
-		};
-
-		readStream.on("data", (chunk: Buffer) => {
-			try {
-				detectBinaryContent(chunk, originalPath);
-				sawAnyBytes = true;
-				buffer += decoder.write(chunk);
-				let newlineIdx: number;
-				while ((newlineIdx = buffer.indexOf("\n")) !== -1) {
-					const line = buffer.slice(0, newlineIdx);
-					buffer = buffer.slice(newlineIdx + 1);
-					handleLine(line, nextLineNumber);
-					nextLineNumber++;
-				}
-				// ponytail: early-stop when collected all requested ranges
-				if (currentBlockIndex >= collectedBlocks.length && nextLineNumber > lastRequestedEnd) {
-					readStream.destroy();
-					finish();
-				}
-			} catch (err) {
-				readStream.destroy();
-				reject(err as Error);
-			}
-		});
-
-		readStream.on("end", () => {
-			finish();
-		});
-
-		readStream.on("error", (err) => {
-			signal?.removeEventListener("abort", onAbort);
-			reject(readError("stream_read_failed", `Stream error reading ${originalPath}: ${err.message}`, undefined, { path: originalPath }));
-		});
-	});
+function sameFingerprint(a: ReturnType<typeof getDocumentFingerprint>, b: { size: number; mtimeMs: number; ctimeMs: number; ino?: number | bigint }): boolean {
+	return a !== undefined && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs && String(a.ino ?? "") === String(b.ino ?? "");
 }
 
 export async function executeRead(
@@ -588,10 +466,21 @@ export async function executeRead(
 		);
 	}
 	throwIfAborted(signal);
+	if (!fileStat.isFile()) {
+		throw readError("not_a_file", `Path is not a regular file: ${path}`, "Choose a regular file.", { path });
+	}
 
 	const mimeType = detectImageMimeType(await readImageHeader(absolutePath));
 	throwIfAborted(signal);
 	if (mimeType) {
+		if (fileStat.size > MAX_IMAGE_FILE_BYTES) {
+			throw readError(
+				"image_too_large",
+				`Image is too large to read: ${path} (${formatSize(fileStat.size)}).`,
+				"Resize the image before reading it.",
+				{ path, size: fileStat.size, maxBytes: MAX_IMAGE_FILE_BYTES },
+			);
+		}
 		const image = await readFile(absolutePath);
 		throwIfAborted(signal);
 		const snapshotId = createStatRevisionId(fileStat);
@@ -612,90 +501,71 @@ export async function executeRead(
 		};
 	}
 
-	// ponytail: dedup unchanged re-reads; outline-only is exempt, outline+ranges dedups the ranges part
-	if (!force) {
-		const prevMtime = getDocumentMtime(absolutePath);
-		if (prevMtime !== undefined && prevMtime === fileStat.mtimeMs) {
-			const prevRev = getCurrentDocumentRevision(absolutePath)!;
-			if (outline && !normalizedRanges) {
-				// outline-only is never deduped
-			} else if (outline && normalizedRanges) {
-				const cached = getDocumentSnapshot(absolutePath, prevRev);
-				if (cached !== undefined) {
-					const { lines: cachedLines, endsWithNewline: cachedEndsNewline } = splitContentLines(cached);
-					const cachedAllLines = cachedEndsNewline ? cachedLines.concat("") : cachedLines;
-					const outlineText = formatOutline(buildOutline(cachedAllLines, path), path);
-					const dedupMsg = `Ranges content unchanged since your last read (snapshotId: ${prevRev}). Content is already in your context. Use force=true only if you need to re-read.`;
-					return {
-						content: [{ type: "text", text: `${outlineText}\n\n---\n${dedupMsg}` }],
-						details: { snapshotId: prevRev },
-					};
-				}
-			} else {
-				return {
-					content: [{ type: "text", text: `Content unchanged since your last read (snapshotId: ${prevRev}). Content is already in your context. Use force=true only if you need to re-read.` }],
-					details: { snapshotId: prevRev },
-				};
-			}
-		}
+	// ponytail: dedup unchanged full re-reads using a complete stat fingerprint.
+	const unchangedRevision = !force && sameFingerprint(getDocumentFingerprint(absolutePath), fileStat) ? getCurrentDocumentRevision(absolutePath) : undefined;
+	if (unchangedRevision && !outline) {
+		return {
+			content: [{ type: "text", text: `Content unchanged since your last read (snapshotId: ${unchangedRevision}). Content is already in your context. Use force=true only if you need to re-read.` }],
+			details: { snapshotId: unchangedRevision },
+		};
 	}
 
-	if (fileStat.size > STREAMING_THRESHOLD) {
-		const snapshotId = createStatRevisionId(fileStat);
-		if (normalizedRanges) return executeReadRangesStreaming(absolutePath, path, normalizedRanges, signal, snapshotId);
-		return executeReadStreaming(absolutePath, path, offset, limit, signal, snapshotId);
+	if (fileStat.size > MAX_TEXT_FILE_BYTES) {
+		throw readError(
+			"file_too_large",
+			`File is too large to read as text: ${path} (${formatSize(fileStat.size)}).`,
+			"Use grep, shell tools, or another tool to inspect a smaller portion.",
+			{ path, size: fileStat.size, maxBytes: MAX_TEXT_FILE_BYTES },
+		);
 	}
 
 	const buffer = await readFile(absolutePath);
 	throwIfAborted(signal);
 	detectBinaryContent(buffer, path);
 	const rawContent = buffer.toString("utf-8");
-	const { lines: fileLines, endsWithNewline } = splitContentLines(rawContent);
-	const allLines = endsWithNewline ? fileLines.concat("") : fileLines;
-	const totalFileLines = allLines.length;
+	const snapshotId = createRevisionId(rawContent);
+	const totalFileLines = forEachContentLine(rawContent, () => {});
+	const contentLineCount = rawContent.endsWith("\n") ? Math.max(0, totalFileLines - 1) : totalFileLines;
 
-	// ponytail: seed mtime only when the read returns the full file content,
-	// so partial reads (offset/limit/ranges that don't cover everything, outline-only)
-	// don't block subsequent reads of other sections.
-	const contentLineCount = fileLines.length; // excludes trailing empty line from final newline
-	const seedsMtime = (() => {
+	// Only a read that returned the complete file seeds dedup metadata. The revision
+	// itself is retained without caching another full copy of the file content.
+	const seedsFingerprint = (() => {
 		if (outline && !normalizedRanges) return false;
 		if (normalizedRanges) {
 			const merged = mergeReadRangeBlocks(normalizedRanges, totalFileLines);
-			if (merged.length !== 1) return false;
-			return merged[0]!.displayStart <= 1 && merged[0]!.displayEnd >= contentLineCount;
+			return merged.length === 1 && merged[0]!.displayStart <= 1 && merged[0]!.displayEnd >= contentLineCount;
 		}
-		const startLine = offset ? Math.max(0, offset - 1) : 0;
-		if (startLine !== 0) return false;
-		if (limit !== undefined && limit < contentLineCount) return false;
-		return true;
+		const startLine = offset ? offset - 1 : 0;
+		return startLine === 0 && (limit === undefined || limit >= contentLineCount);
 	})();
-	const snapshotId = rememberDocumentSnapshot(absolutePath, rawContent, seedsMtime ? fileStat.mtimeMs : undefined);
+	rememberDocumentRevision(absolutePath, snapshotId, seedsFingerprint ? fileStat : undefined);
 
 	if (outline) {
-		const outlineText = formatOutline(buildOutline(allLines, path), path);
+		const outlineText = formatOutline(buildOutline(rawContent, path), path);
 		if (!normalizedRanges) {
 			return { content: [{ type: "text", text: buildReadResponseText(outlineText, snapshotId) }], details: { snapshotId } };
 		}
-		const rangeResult = finalizeRangeReadResult(buildRangeBlocksFromLines(allLines, normalizedRanges, totalFileLines), normalizedRanges, totalFileLines, snapshotId);
-		const combined = `${outlineText}\n\n---\n${rangeResult.content[0]!.text}`;
-		return { content: [{ type: "text", text: combined }], details: rangeResult.details };
+		if (unchangedRevision) {
+			const dedupMsg = `Ranges content unchanged since your last read (snapshotId: ${unchangedRevision}). Content is already in your context. Use force=true only if you need to re-read.`;
+			return { content: [{ type: "text", text: `${outlineText}\n\n---\n${dedupMsg}` }], details: { snapshotId: unchangedRevision } };
+		}
+		const rangeResult = finalizeRangeReadResult(buildRangeBlocksFromContent(rawContent, normalizedRanges, totalFileLines), normalizedRanges, totalFileLines, snapshotId);
+		return { content: [{ type: "text", text: `${outlineText}\n\n---\n${rangeResult.content[0]!.text}` }], details: rangeResult.details };
 	}
 
-	if (normalizedRanges) return finalizeRangeReadResult(buildRangeBlocksFromLines(allLines, normalizedRanges, totalFileLines), normalizedRanges, totalFileLines, snapshotId);
+	if (normalizedRanges) return finalizeRangeReadResult(buildRangeBlocksFromContent(rawContent, normalizedRanges, totalFileLines), normalizedRanges, totalFileLines, snapshotId);
 
-	const startLine = offset ? Math.max(0, offset - 1) : 0;
-	if (offset !== undefined && startLine >= allLines.length) return buildOffsetOutOfRangeResult(offset, allLines.length, snapshotId);
-
-	const selectedLines = limit !== undefined ? allLines.slice(startLine, startLine + limit) : allLines.slice(startLine);
-	return finalizeContiguousReadResult(selectedLines.join("\n"), snapshotId, startLine, totalFileLines, limit);
+	const startLine = offset ? offset - 1 : 0;
+	if (offset !== undefined && startLine >= totalFileLines) return buildOffsetOutOfRangeResult(offset, totalFileLines, snapshotId);
+	const selected = selectContiguousContent(rawContent, startLine, limit);
+	return finalizeContiguousReadResult(selected.text, snapshotId, startLine, selected.totalLines, limit);
 }
 
 export function registerReadTool(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "read",
 		label: "read",
-		description: `Read text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. Text output is truncated to ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB. Use offset/limit for large files, or ranges for explicit line windows with optional context. Large text files (>5MB) are streamed to avoid OOM.`,
+		description: `Read text files and images up to ${MAX_TEXT_FILE_BYTES / (1024 * 1024)}MB (jpg, png, gif, webp, bmp). Images are sent as attachments. Text output is truncated to ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB. Use offset/limit for large files, or ranges for explicit line windows with optional context.`,
 		promptSnippet: "Read file contents",
 		promptGuidelines: [
 			"Read is the primary way to inspect file contents. When the user names a file or you need its text, read it directly — don't grep or find first.",

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { executeRead } from "../extensions/read.ts";
@@ -324,6 +324,123 @@ test("executeRead full range read does seed mtime and dedups subsequent full rea
 		const second = await executeRead(file, undefined, undefined, undefined, dir, [{ start: 1, end: 3 }], undefined, undefined);
 		const secondText = extractText(second);
 		assert.match(secondText, /Content unchanged/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeRead truncates contiguous output by line count with a continuation offset", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-read-line-budget-"));
+	try {
+		const file = join(dir, "many-lines.txt");
+		await writeFile(file, Array.from({ length: 2105 }, (_, index) => `line-${index + 1}`).join("\n"), "utf-8");
+		const result = await executeRead(file, undefined, undefined, undefined, dir, undefined, undefined, true);
+		const text = extractText(result);
+		assert.match(text, /truncated at 2000 lines/);
+		assert.match(text, /Use offset=2001 to continue/);
+		assert.doesNotMatch(text, /line-2105/);
+		assert.ok((result.details as { truncation?: unknown })?.truncation);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeRead enforces the byte budget without splitting UTF-8 surrogate pairs", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-read-byte-budget-"));
+	try {
+		const file = join(dir, "unicode.txt");
+		await writeFile(file, Array.from({ length: 1000 }, () => "😀".repeat(40)).join("\n"), "utf-8");
+		const result = await executeRead(file, undefined, undefined, undefined, dir, undefined, undefined, true);
+		const text = extractText(result);
+		assert.match(text, /truncated at/);
+		assert.doesNotMatch(text, /\uFFFD/);
+		const snapshotIndex = text.indexOf("\nsnapshotId:");
+		assert.ok(snapshotIndex > 0);
+		const content = text.slice(0, snapshotIndex);
+		assert.equal(content.charCodeAt(content.length - 1) >= 0xdc00 && content.charCodeAt(content.length - 1) <= 0xdfff, true);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeRead truncates outline collection while preserving the total declaration count", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-read-outline-budget-"));
+	try {
+		const file = join(dir, "many.ts");
+		await writeFile(file, Array.from({ length: 2105 }, (_, index) => `export function f${index}() {}`).join("\n"), "utf-8");
+		const text = extractText(await executeRead(file, undefined, undefined, undefined, dir, undefined, true, true));
+		assert.match(text, /outline for many\.ts — 2105 declarations/);
+		assert.match(text, /Outline truncated/);
+		assert.doesNotMatch(text, /f2104/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeRead truncates range collection and reports EOF clipping", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-read-range-budget-"));
+	try {
+		const file = join(dir, "many.txt");
+		await writeFile(file, Array.from({ length: 2105 }, (_, index) => `line-${index + 1}`).join("\n"), "utf-8");
+		const result = await executeRead(file, undefined, undefined, undefined, dir, [{ start: 1, end: 2200 }], undefined, true);
+		const text = extractText(result);
+		assert.match(text, /Range read truncated/);
+		assert.match(text, /clipped at EOF/);
+		assert.ok((result.details as { truncation?: unknown })?.truncation);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeRead validates ranges and merges adjacent windows", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-read-range-validation-"));
+	try {
+		const file = join(dir, "demo.txt");
+		await writeFile(file, "one\ntwo\nthree\nfour", "utf-8");
+		await assert.rejects(() => executeRead(file, 1, undefined, undefined, dir, [{ start: 2 }], true), /invalid_input/);
+		await assert.rejects(() => executeRead(file, undefined, undefined, undefined, dir, [{ start: 3, end: 2 }]), /invalid_range/);
+
+		const merged = extractText(await executeRead(file, undefined, undefined, undefined, dir, [{ start: 1, end: 2 }, { start: 3, end: 3 }], undefined, true));
+		assert.match(merged, /merged requests: lines 1-2, line 3/);
+		assert.match(merged, /1\|one/);
+		assert.match(merged, /3\|three/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeRead reports ranges entirely beyond EOF", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-read-range-eof-"));
+	try {
+		const file = join(dir, "demo.txt");
+		await writeFile(file, "one\ntwo", "utf-8");
+		const text = extractText(await executeRead(file, undefined, undefined, undefined, dir, [{ start: 10 }, { start: 20 }], undefined, true));
+		assert.match(text, /Line 10 is beyond end of file \(2 lines total\)/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeRead rejects binary files and non-file paths", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-read-invalid-file-"));
+	try {
+		const binary = join(dir, "binary.dat");
+		await writeFile(binary, Buffer.from([1, 0, 2]));
+		await assert.rejects(() => executeRead(binary, undefined, undefined, undefined, dir), /binary_file/);
+		await assert.rejects(() => executeRead(dir, undefined, undefined, undefined, dir), /not_a_file/);
+		await assert.rejects(() => executeRead(join(dir, "missing.txt"), undefined, undefined, undefined, dir), /file_not_found/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("executeRead rejects recognized images over 20MB before loading them", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-read-image-limit-"));
+	try {
+		const file = join(dir, "large.png");
+		await writeFile(file, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+		await truncate(file, 20 * 1024 * 1024 + 1);
+		await assert.rejects(() => executeRead(file, undefined, undefined, undefined, dir), /image_too_large/);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}

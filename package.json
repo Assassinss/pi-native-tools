@@ -7,7 +7,7 @@
     "pi-package"
   ],
   "scripts": {
-    "test": "node --test tests/entry.test.ts tests/integration.test.ts tests/edit.test.ts",
+    "test": "node --test tests/*.test.ts",
     "bench": "node scripts/bench.ts",
     "eval:tool-calls:agent": "node scripts/run-tool-call-agent-eval.ts"
   },

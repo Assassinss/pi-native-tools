@@ -1,6 +1,6 @@
 import type { TextContent } from "@earendil-works/pi-ai";
 import { createHash } from "node:crypto";
-import { createReadStream, createWriteStream } from "node:fs";
+import { createWriteStream } from "node:fs";
 import {
   mkdir,
   readFile,
@@ -18,7 +18,6 @@ import {
 
 export type { TextContent } from "@earendil-works/pi-ai";
 export {
-  createReadStream,
   createWriteStream,
   mkdir,
   readFile,
@@ -36,7 +35,6 @@ export {
 export const STREAMING_THRESHOLD = 5 * 1024 * 1024; // ponytail: 5MB threshold, tune if large-file patterns change
 export const WRITE_CHUNK_SIZE = 64 * 1024;
 export const HASH_SHORT_LEN = 8;
-export const STREAM_READ_CHUNK_SIZE = 256 * 1024; // ponytail: 256KB chunks, tune if read latency matters
 
 export type LineContent = {
   lines: string[];
@@ -85,14 +83,16 @@ export function fullHash(content: string | Buffer): string {
   return createHash("sha256").update(content).digest("hex");
 }
 
-const DOCUMENT_HISTORY_LIMIT = 8;
+export type DocumentFingerprint = {
+  size: number;
+  mtimeMs: number;
+  ctimeMs: number;
+  ino?: number | bigint;
+};
 
 type DocumentHistory = {
   currentRevisionId: string;
-  mtimeMs: number;
-  snapshots: Map<string, string>;
-  lineSnapshots: Map<string, Map<number, string>>;
-  order: string[];
+  fingerprint?: DocumentFingerprint;
 };
 
 const documentHistories = new Map<string, DocumentHistory>();
@@ -101,99 +101,28 @@ export function createRevisionId(content: string | Buffer): string {
   return `rev_${fullHash(content).slice(0, 12)}`;
 }
 
-export function createStatRevisionId(fileStat: {
-  size: number;
-  mtimeMs: number;
-  ctimeMs: number;
-  ino?: number | bigint;
-}): string {
+export function createStatRevisionId(fileStat: DocumentFingerprint): string {
   return createRevisionId(
     `${fileStat.size}:${fileStat.mtimeMs}:${fileStat.ctimeMs}:${String(fileStat.ino ?? "")}`,
   );
 }
 
-export function rememberDocumentSnapshot(
-  absolutePath: string,
-  content: string,
-  mtimeMs?: number,
-): string {
-  const revisionId = createRevisionId(content);
-  let history = documentHistories.get(absolutePath);
-  if (!history) {
-    history = {
-      currentRevisionId: revisionId,
-      mtimeMs: mtimeMs ?? 0,
-      snapshots: new Map(),
-      lineSnapshots: new Map(),
-      order: [],
-    };
-    documentHistories.set(absolutePath, history);
-  }
-  history.currentRevisionId = revisionId;
-  if (mtimeMs !== undefined) history.mtimeMs = mtimeMs;
-  if (!history.snapshots.has(revisionId)) history.order.push(revisionId);
-  history.snapshots.set(revisionId, content);
-  while (history.order.length > DOCUMENT_HISTORY_LIMIT) {
-    const staleRevisionId = history.order.shift()!;
-    if (staleRevisionId !== history.currentRevisionId) {
-      history.snapshots.delete(staleRevisionId);
-      history.lineSnapshots.delete(staleRevisionId);
-    }
-  }
-  return revisionId;
-}
-
-export function getDocumentSnapshot(
+export function rememberDocumentRevision(
   absolutePath: string,
   revisionId: string,
-): string | undefined {
-  return documentHistories.get(absolutePath)?.snapshots.get(revisionId);
-}
-
-export function rememberDocumentLineSnapshot(
-  absolutePath: string,
-  revisionId: string,
-  lines: Array<{ lineNumber: number; line: string }>,
+  fingerprint?: DocumentFingerprint,
 ): string {
   let history = documentHistories.get(absolutePath);
   if (!history) {
     history = {
       currentRevisionId: revisionId,
-      snapshots: new Map(),
-      lineSnapshots: new Map(),
-      order: [],
+      fingerprint,
     };
     documentHistories.set(absolutePath, history);
   }
   history.currentRevisionId = revisionId;
-  if (
-    !history.lineSnapshots.has(revisionId) &&
-    !history.snapshots.has(revisionId)
-  )
-    history.order.push(revisionId);
-  const snapshot =
-    history.lineSnapshots.get(revisionId) ?? new Map<number, string>();
-  for (const entry of lines) snapshot.set(entry.lineNumber, entry.line);
-  history.lineSnapshots.set(revisionId, snapshot);
-  while (history.order.length > DOCUMENT_HISTORY_LIMIT) {
-    const staleRevisionId = history.order.shift()!;
-    if (staleRevisionId !== history.currentRevisionId) {
-      history.snapshots.delete(staleRevisionId);
-      history.lineSnapshots.delete(staleRevisionId);
-    }
-  }
+  if (fingerprint !== undefined) history.fingerprint = { ...fingerprint };
   return revisionId;
-}
-
-export function getDocumentLineSnapshot(
-  absolutePath: string,
-  revisionId: string,
-  lineNumber: number,
-): string | undefined {
-  return documentHistories
-    .get(absolutePath)
-    ?.lineSnapshots.get(revisionId)
-    ?.get(lineNumber);
 }
 
 export function getCurrentDocumentRevision(
@@ -202,9 +131,8 @@ export function getCurrentDocumentRevision(
   return documentHistories.get(absolutePath)?.currentRevisionId;
 }
 
-export function getDocumentMtime(absolutePath: string): number | undefined {
-  const h = documentHistories.get(absolutePath);
-  return h ? h.mtimeMs : undefined;
+export function getDocumentFingerprint(absolutePath: string): DocumentFingerprint | undefined {
+  return documentHistories.get(absolutePath)?.fingerprint;
 }
 
 export function normalizePath(path: string, cwd: string): string {

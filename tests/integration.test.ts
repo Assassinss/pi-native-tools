@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, realpath, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, realpath, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { STREAMING_THRESHOLD, STREAM_READ_CHUNK_SIZE } from "../extensions/shared.ts";
+import { STREAMING_THRESHOLD } from "../extensions/shared.ts";
 import { clearBashSessions, getBashSessionCount } from "../extensions/bash.ts";
 import extension from "../index.ts";
 
@@ -329,16 +329,16 @@ test("registered native grep reports missing paths with a structured code", asyn
 	}
 });
 
-test("registered read reports offset past EOF for streamed files", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-tools-read-stream-eof-"));
+test("registered read reports offset past EOF", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-read-eof-"));
 	try {
 		const pi = createPiStub();
 		extension(pi as any);
 		const read = pi.tools.get("read");
 		assert.ok(read);
 
-		const file = join(dir, "stream-eof.txt");
-		await writeFile(file, `line-1\nline-2\n${"x".repeat(STREAMING_THRESHOLD)}`, "utf-8");
+		const file = join(dir, "read-eof.txt");
+		await writeFile(file, "line-1\nline-2\nline-3", "utf-8");
 		const result = await read!.execute("1", { path: file, offset: 5, limit: 1 }, undefined, undefined, { cwd: dir });
 		const text = extractText(result);
 		assert.match(text, /Line 5 is beyond end of file \(3 lines total\)/);
@@ -348,22 +348,40 @@ test("registered read reports offset past EOF for streamed files", async () => {
 	}
 });
 
-test("registered read preserves utf-8 characters split across stream chunks", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-tools-read-stream-utf8-"));
+test("registered read preserves utf-8 characters", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-read-utf8-"));
 	try {
 		const pi = createPiStub();
 		extension(pi as any);
 		const read = pi.tools.get("read");
 		assert.ok(read);
 
-		const file = join(dir, "stream-utf8.txt");
-		const prefix = "a".repeat(STREAM_READ_CHUNK_SIZE - 3) + "\n";
-		const content = `${prefix}x你\n${"b".repeat(STREAMING_THRESHOLD)}`;
-		await writeFile(file, content, "utf-8");
+		const file = join(dir, "read-utf8.txt");
+		await writeFile(file, "prefix\nx你\nsuffix", "utf-8");
 		const result = await read!.execute("1", { path: file, offset: 2, limit: 1 }, undefined, undefined, { cwd: dir });
 		const text = extractText(result);
 		assert.match(text, /^x你/m);
 		assert.doesNotMatch(text, /\u0000|\uFFFD/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("registered read rejects text files over 20MB", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-read-too-large-"));
+	try {
+		const pi = createPiStub();
+		extension(pi as any);
+		const read = pi.tools.get("read");
+		assert.ok(read);
+
+		const file = join(dir, "too-large.txt");
+		await writeFile(file, "", "utf-8");
+		await truncate(file, 20 * 1024 * 1024 + 1);
+		await assert.rejects(
+			read!.execute("1", { path: file }, undefined, undefined, { cwd: dir }),
+			/file_too_large/,
+		);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
