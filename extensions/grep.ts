@@ -19,8 +19,9 @@ function grepError(code: string, message: string, hint?: string, details?: Recor
 const builtInGrep = createGrepToolDefinition(process.cwd());
 const DEFAULT_LIMIT = 100;
 const SEARCH_TIMEOUT_MS = 30_000;
-const MODEL_MAX_BYTES = 16 * 1024;
-const MODEL_MAX_LINES = 500;
+// Keep tool results compact; callers can raise `limit` when more matches are needed.
+const MODEL_MAX_BYTES = 8 * 1024;
+const MODEL_MAX_LINES = 250;
 const NOTICE_RESERVE_BYTES = 1024;
 const NOTICE_RESERVE_LINES = 2;
 const MAX_MATCHES_PER_FILE = 8;
@@ -291,14 +292,14 @@ export function registerGrepTool(pi: ExtensionAPI): void {
 	pi.registerTool({
 		...builtInGrep,
 		description:
-			"Search file contents by regex or literal pattern. Use this when you need matching lines, counts, or files with matches. Prefer find for path discovery, read for full file inspection, and bash only for shell-specific tasks. Respects .gitignore and truncates long lines in output.",
+			"Search file contents by regex or literal pattern. Use this when you need matching lines, counts, or files with matches. Respects .gitignore and truncates long lines in output.",
 		promptSnippet: "Search file contents by regex or literal pattern",
 		promptGuidelines: [
-			"Search across files only; use read when the file path is already known.",
-			"Narrow searches with path and glob. Keep context=0 unless adjacent lines are needed.",
-			"Use mode=filesWithMatches to locate files and mode=count for totals before requesting content.",
+			"Use grep for regex or literal content searches; set path and glob to narrow the search when useful.",
+			"Use context when the lines surrounding a match are relevant; leave it at 0 for concise results.",
+			"Use mode=filesWithMatches for matching paths and mode=count for per-file match totals.",
 			"Use literal=true for exact text containing regex metacharacters.",
-			"Read returned files for full context instead of repeatedly grepping them.",
+			"Use read or other tools when you need full file context or additional processing.",
 		],
 		parameters: grepSchema,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {

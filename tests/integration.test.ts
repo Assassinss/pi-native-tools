@@ -418,6 +418,108 @@ test("registered native bash compacts repeated output", async () => {
 	}
 });
 
+test("registered native bash removes progress redraws and blank-line noise", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-native-bash-noise-"));
+	try {
+		const pi = createPiStub();
+		extension(pi as any);
+		const bash = pi.tools.get("bash");
+		assert.ok(bash);
+
+		const result = await bash!.execute("1", { command: "printf 'progress 1\\rprogress 2\\n\\n\\nresult\\n'" }, undefined, undefined, { cwd: dir });
+		assert.equal(extractText(result).trim(), "progress 2\n\nresult");
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("registered native bash summarizes successful diagnostic output", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-native-bash-diagnostic-success-"));
+	try {
+		const pi = createPiStub();
+		extension(pi as any);
+		const bash = pi.tools.get("bash");
+		assert.ok(bash);
+		await writeFile(join(dir, "package.json"), JSON.stringify({ scripts: { test: "echo internal-test-noise" } }));
+
+		const result = await bash!.execute("1", { command: "npm test" }, undefined, undefined, { cwd: dir });
+		assert.equal(extractText(result), "Command completed successfully.");
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("registered native bash preserves diagnostic errors and file locations", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-native-bash-diagnostic-failure-"));
+	try {
+		const pi = createPiStub();
+		extension(pi as any);
+		const bash = pi.tools.get("bash");
+		assert.ok(bash);
+		await writeFile(join(dir, "package.json"), JSON.stringify({ scripts: { test: "echo src/index.ts:12:5: error TS2322 && exit 1" } }));
+
+		await assert.rejects(
+			() => bash!.execute("1", { command: "npm test" }, undefined, undefined, { cwd: dir }),
+			(error: Error) => /src\/index\.ts:12:5: error TS2322/.test(error.message) && /Command exited with code 1/.test(error.message),
+		);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("registered native bash keeps progress command output compact", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-native-bash-progress-"));
+	try {
+		const pi = createPiStub();
+		extension(pi as any);
+		const bash = pi.tools.get("bash");
+		assert.ok(bash);
+		await writeFile(join(dir, "package.json"), JSON.stringify({ scripts: { build: "seq 0 39" } }));
+
+		const result = await bash!.execute("1", { command: "npm run build --silent" }, undefined, undefined, { cwd: dir });
+		const text = extractText(result);
+		assert.match(text, /39/);
+		assert.doesNotMatch(text, /\b0\b/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("registered native bash preserves result and passthrough command output", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-native-bash-policies-"));
+	try {
+		const pi = createPiStub();
+		extension(pi as any);
+		const bash = pi.tools.get("bash");
+		assert.ok(bash);
+
+		const result = await bash!.execute("1", { command: "pwd" }, undefined, undefined, { cwd: dir });
+		assert.equal(await realpath(extractText(result).trim()), await realpath(dir));
+		const passthrough = await bash!.execute("2", { command: "printf 'custom output\\n'" }, undefined, undefined, { cwd: dir });
+		assert.equal(extractText(passthrough).trim(), "custom output");
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("registered native bash strips ANSI output and exposes truncation details", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-native-bash-truncation-"));
+	try {
+		const pi = createPiStub();
+		extension(pi as any);
+		const bash = pi.tools.get("bash");
+		assert.ok(bash);
+
+		const ansi = await bash!.execute("1", { command: "printf 'red\\n'" }, undefined, undefined, { cwd: dir });
+		assert.equal(extractText(ansi).trim(), "red");
+		const large = await bash!.execute("2", { command: "printf 'line\\n%.0s' {1..400}" }, undefined, undefined, { cwd: dir });
+		assert.ok(large.details);
+		assert.match(extractText(large), /Full output:/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
 test("registered native bash supports session controls", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-tools-native-bash-session-controls-"));
 	try {

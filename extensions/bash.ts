@@ -45,8 +45,9 @@ const bashSchema = Type.Object(
 );
 type BashInput = Static<typeof bashSchema>;
 
-const MODEL_MAX_BYTES = 16 * 1024;
-const MODEL_MAX_LINES = 500;
+// Keep shell output compact for the model; full output remains available when truncated.
+const MODEL_MAX_BYTES = 8 * 1024;
+const MODEL_MAX_LINES = 250;
 const shellSessions = new Map<string, Shell>();
 const shellSessionsInitialized = new Set<string>();
 const shellSessionsInUse = new Set<string>();
@@ -61,17 +62,43 @@ function byteLength(text: string): number {
 	return Buffer.byteLength(text, "utf-8");
 }
 
+type OutputPolicy = "result" | "diagnostic" | "progress" | "passthrough";
+
+function classifyCommand(command: string): OutputPolicy {
+	const normalized = command.replace(/\s+/g, " ").trim().toLowerCase();
+	if (/^(?:pwd|whoami|hostname|date|env|printenv|git (?:status|log|diff|show|branch|rev-parse)|rg |grep |find |ls(?: |$)|cat )/.test(normalized)) return "result";
+	if (/(?:npm|pnpm|yarn|bun)\s+(?:install|ci|update|build|run\s+build)|(?:cargo|go)\s+(?:build|check)|docker\s+build/.test(normalized)) return "progress";
+	if (/(?:npm|pnpm|yarn|bun)\s+(?:test|run\s+(?:test|lint|typecheck))|(?:pytest|vitest|jest|mocha|cargo\s+test|go\s+test|tsc|eslint|prettier\s+--check)/.test(normalized)) return "diagnostic";
+	return "passthrough";
+}
+
 function compactOutput(text: string): string {
-	const lines = text.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "").replace(/\r/g, "").split("\n");
+	const ansiStripped = text.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
+	const lines: string[] = [];
+	for (const rawLine of ansiStripped.split("\n")) {
+		// Progress indicators commonly redraw the same line with carriage returns.
+		const refreshed = rawLine.split("\r").filter(Boolean).at(-1) ?? "";
+		if (refreshed.trim() || lines.at(-1)?.trim()) lines.push(refreshed);
+	}
+
 	const compacted: string[] = [];
 	for (let start = 0; start < lines.length;) {
 		let end = start + 1;
 		while (end < lines.length && lines[end] === lines[start]) end++;
-		const line = lines[start];
-		if (line || compacted.at(-1) !== "") compacted.push(end - start > 1 && line ? `${line} [repeated ${end - start} times]` : line);
+		const line = lines[start]!;
+		compacted.push(end - start > 1 && line ? `${line} [repeated ${end - start} times]` : line);
 		start = end;
 	}
 	return compacted.join("\n");
+}
+
+function summarizeDiagnosticOutput(text: string, policy: OutputPolicy, successful: boolean): string {
+	const lines = text.split("\n").filter((line) => line.trim());
+	if (policy === "passthrough" || policy === "result") return text;
+	const important = lines.filter((line) => /\b(?:error|warning|warn|failed|failure|exception|panic|fatal|passed)\b|(?::\d+(?::\d+)?\s*[-—:]?)/i.test(line));
+	if (!successful) return [...new Set([...important, ...lines.slice(-8)])].join("\n");
+	if (policy === "diagnostic") return important.length > 0 ? [...new Set(important)].join("\n") : "Command completed successfully.";
+	return important.length > 0 ? [...new Set([...important, ...lines.slice(-3)])].join("\n") : lines.slice(-3).join("\n");
 }
 
 class OutputAccumulator {
@@ -282,9 +309,10 @@ export async function clearBashSessions(): Promise<void> {
 	await Promise.all([...shellSessions.keys()].map(disposeShellSession));
 }
 
-function formatOutput(snapshot: OutputSnapshot, emptyText = "(no output)"): { text: string; details?: BashToolDetails } {
+function formatOutput(snapshot: OutputSnapshot, command: string, successful: boolean, emptyText = "(no output)"): { text: string; details?: BashToolDetails } {
 	const truncation = snapshot.truncation;
-	let text = compactOutput(snapshot.content) || emptyText;
+	const compacted = compactOutput(snapshot.content);
+	let text = summarizeDiagnosticOutput(compacted, classifyCommand(command), successful) || emptyText;
 	let details: BashToolDetails | undefined;
 	if (truncation.truncated) {
 		details = { truncation, fullOutputPath: snapshot.fullOutputPath };
@@ -413,7 +441,7 @@ export async function executeBashNative(
 			accumulator.finish();
 			const snapshot = accumulator.snapshot();
 			await accumulator.closeTempFile();
-			const { text } = formatOutput(snapshot, "");
+			const { text } = formatOutput(snapshot, command, false, "");
 			if (controller.signal.aborted) {
 				throw bashError("aborted", appendStatus(text, "Command aborted"), "Retry the command if cancellation was unintended.", { cwd: resolvedCwd });
 			}
@@ -426,7 +454,7 @@ export async function executeBashNative(
 		accumulator.finish();
 		const snapshot = accumulator.snapshot();
 		await accumulator.closeTempFile();
-		const { text, details } = formatOutput(snapshot);
+		const { text, details } = formatOutput(snapshot, command, (result.exitCode ?? 0) === 0 && !result.cancelled && !result.timedOut);
 		if (result.cancelled || controller.signal.aborted) {
 			throw bashError("aborted", appendStatus(text, "Command aborted"), "Retry the command if cancellation was unintended.", { cwd: resolvedCwd });
 		}
@@ -467,15 +495,14 @@ export function registerBashTool(pi: ExtensionAPI): void {
 	pi.registerTool({
 		...builtInBash,
 		description:
-			"Execute shell commands in the current working directory. Use this for build, test, run, git, and other shell-specific tasks. Do not use it for routine file reading or code search when read, find, or grep can answer more directly. Output is truncated and full output is retrievable via the artifact system.",
+			"Execute shell commands and scripts in the current working directory. Use this for file operations, code search, build, test, run, git, and other shell tasks. Output is truncated and full output is retrievable via the artifact system.",
 		promptSnippet: "Run shell commands",
 		promptGuidelines: [
-			"Use bash to execute shell commands, scripts, builds, tests, git operations, and environment inspection.",
-			"Prefer focused commands with concise output; reduce verbose success logs while preserving warnings and failure details.",
+			"Use bash whenever shell commands or scripts are the most direct way to complete the task, including file operations, code search, builds, tests, runs, git operations, and environment inspection.",
+			"Prefer focused commands and concise output when practical, while preserving warnings and failure details.",
 			"Set an appropriate timeout for commands that may block or run for a long time.",
-			"Run bash commands sequentially by default: wait for one command to finish before starting another in the same cwd.",
-			"Do not launch parallel bash calls that share the persistent session; they can fail with session_busy. If parallel execution is necessary, set session=false on every concurrent call.",
-			"Bash sessions persist per cwd, including directory and environment changes; use session=false for isolation or resetSession=true for a clean session.",
+			"Choose session=true when commands need to share shell state; use session=false for isolated commands.",
+			"Do not run parallel commands that share the same persistent session; use session=false for concurrent commands.",
 		],
 		parameters: bashSchema,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
