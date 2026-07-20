@@ -1041,14 +1041,12 @@ export function registerBashTool(pi: ExtensionAPI): void {
 	pi.registerTool({
 		...builtInBash,
 		description:
-			"Execute shell commands and scripts in the current working directory. Use this for file operations, code search, build, test, run, git, and other shell tasks. Output is truncated and full output is retrievable via the artifact system.",
-		promptSnippet: "Run shell commands",
+			"Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 200 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.",
+		promptSnippet: "Execute bash commands (ls, grep, find, etc.)",
 		promptGuidelines: [
-			"Use bash whenever shell commands or scripts are the most direct way to complete the task, including file operations, code search, builds, tests, runs, git operations, and environment inspection.",
-			"Prefer focused commands and concise output when practical, while preserving warnings and failure details.",
-			"Set an appropriate timeout for commands that may block or run for a long time.",
-			"Choose session=true when commands need to share shell state; use session=false for isolated commands.",
-			"Do not run parallel commands that share the same persistent session; use session=false for concurrent commands.",
+			"Use timeout in seconds for commands that may block or run for a long time.",
+			"Use session=true when commands need to share shell state; use session=false for an isolated one-shot shell.",
+			"Use resetSession=true to discard the existing persistent shell session for the current working directory before running the command.",
 		],
 		parameters: bashSchema,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {

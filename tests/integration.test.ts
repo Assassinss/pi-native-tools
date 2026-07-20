@@ -176,9 +176,11 @@ test("registered native find and grep work end-to-end", async () => {
 		const pi = createPiStub();
 		extension(pi as any);
 		const write = pi.tools.get("write");
+		const read = pi.tools.get("read");
 		const find = pi.tools.get("find");
 		const grep = pi.tools.get("grep");
 		assert.ok(write);
+		assert.ok(read);
 		assert.ok(find);
 		assert.ok(grep);
 
@@ -195,7 +197,17 @@ test("registered native find and grep work end-to-end", async () => {
 			undefined,
 			{ cwd: dir },
 		);
-		assert.match(extractText(grepResult), /main\.ts:1: const needle = 1;/);
+		assert.equal(extractText(grepResult).trim(), "src/main.ts:1");
+		assert.doesNotMatch(extractText(grepResult), /const needle/);
+
+		const readResult = await read!.execute(
+			"5",
+			{ path: "src/main.ts", ranges: [{ start: 1, end: 1 }] },
+			undefined,
+			undefined,
+			{ cwd: dir },
+		);
+		assert.match(extractText(readResult), /1\|const needle = 1;/);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
@@ -221,8 +233,8 @@ test("registered native grep supports count and filesWithMatches modes", async (
 			undefined,
 			{ cwd: dir },
 		);
-		assert.match(extractText(countResult), /a\.ts: 2/);
-		assert.match(extractText(countResult), /b\.ts: 1/);
+		assert.match(extractText(countResult), /src\/a\.ts: 2/);
+		assert.match(extractText(countResult), /src\/b\.ts: 1/);
 
 		const filesResult = await grep!.execute(
 			"4",
@@ -231,8 +243,8 @@ test("registered native grep supports count and filesWithMatches modes", async (
 			undefined,
 			{ cwd: dir },
 		);
-		assert.match(extractText(filesResult), /a\.ts/);
-		assert.match(extractText(filesResult), /b\.ts/);
+		assert.match(extractText(filesResult), /src\/a\.ts/);
+		assert.match(extractText(filesResult), /src\/b\.ts/);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
@@ -251,8 +263,9 @@ test("registered native grep limits repetitive matches per file", async () => {
 		await write!.execute("1", { path: join(dir, "many.ts"), content: Array(10).fill("needle").join("\n") }, undefined, undefined, { cwd: dir });
 		const result = await grep!.execute("2", { pattern: "needle", path: dir }, undefined, undefined, { cwd: dir });
 		const text = extractText(result);
-		assert.equal((text.match(/many\.ts:\d+: needle/g) ?? []).length, 8);
+		assert.equal(text.split("\n")[0], "many.ts:1-8");
 		assert.match(text, /At least 1 match in 1 file omitted/);
+		assert.doesNotMatch(text, /needle\n/);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
@@ -268,8 +281,8 @@ test("registered native grep accepts native regex syntax and literal metacharact
 		await writeFile(join(dir, "patterns.txt"), "Needle\n()[]?.*\n", "utf-8");
 
 		const regexResult = await grep!.execute("1", { pattern: "(?i)needle", path: dir }, undefined, undefined, { cwd: dir });
-		assert.match(extractText(regexResult), /Needle/);
-		const literalResult = await grep!.execute("2", { pattern: "()[]?.*", path: dir, literal: true }, undefined, undefined, { cwd: dir });
+		assert.equal(extractText(regexResult).trim(), "patterns.txt:1");
+		const literalResult = await grep!.execute("2", { pattern: "()[]?.*", path: dir, literal: true, mode: "content" }, undefined, undefined, { cwd: dir });
 		assert.match(extractText(literalResult), /\(\)\[\]\?\.\*/);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
@@ -288,8 +301,54 @@ test("registered native grep distributes matches across files", async () => {
 
 		const result = await grep!.execute("1", { pattern: "needle", path: dir, limit: 20 }, undefined, undefined, { cwd: dir });
 		const text = extractText(result);
-		assert.match(text, /a\.ts:1: needle/);
-		assert.match(text, /b\.ts:1: needle/);
+		assert.match(text, /a\.ts:1-8/);
+		assert.match(text, /b\.ts:1/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("registered native grep groups locations and read can inspect the returned ranges", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-tools-native-grep-locations-"));
+	try {
+		const pi = createPiStub();
+		extension(pi as any);
+		const grep = pi.tools.get("grep");
+		const read = pi.tools.get("read");
+		assert.ok(grep);
+		assert.ok(read);
+		const file = join(dir, "locations.ts");
+		await writeFile(file, "zero\nneedle one\ntwo\nneedle two\nlast\n", "utf-8");
+
+		const locations = await grep!.execute("1", { pattern: "needle", path: file }, undefined, undefined, { cwd: dir });
+		const locationText = extractText(locations);
+		assert.equal(locationText.trim(), "locations.ts:2,4");
+		assert.deepEqual((locations.details as { locations?: unknown })?.locations, [{ path: "locations.ts", ranges: [{ start: 2, end: 2 }, { start: 4, end: 4 }] }]);
+
+		const direct = await read!.execute(
+			"2a",
+			{ locations: locationText },
+			undefined,
+			undefined,
+			{ cwd: dir },
+		);
+		const directText = extractText(direct);
+		assert.match(directText, /\[locations\.ts\]/);
+		assert.match(directText, /2\|needle one/);
+		assert.match(directText, /4\|needle two/);
+		assert.doesNotMatch(directText, /1\|zero|3\|two|5\|last/);
+
+		const selected = await read!.execute(
+			"2",
+			{ path: file, ranges: [{ start: 2 }, { start: 4 }] },
+			undefined,
+			undefined,
+			{ cwd: dir },
+		);
+		const selectedText = extractText(selected);
+		assert.match(selectedText, /2\|needle one/);
+		assert.match(selectedText, /4\|needle two/);
+		assert.doesNotMatch(selectedText, /0\|zero|5\|last/);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
@@ -304,7 +363,7 @@ test("registered native grep de-duplicates overlapping context lines", async () 
 		assert.ok(grep);
 		await writeFile(join(dir, "context.ts"), "before\nneedle one\nneedle two\nafter\n", "utf-8");
 
-		const result = await grep!.execute("1", { pattern: "needle", path: dir, context: 1 }, undefined, undefined, { cwd: dir });
+		const result = await grep!.execute("1", { pattern: "needle", path: dir, context: 1, mode: "content" }, undefined, undefined, { cwd: dir });
 		const text = extractText(result);
 		assert.equal((text.match(/context\.ts:2: needle one/g) ?? []).length, 1);
 		assert.equal((text.match(/context\.ts:3: needle two/g) ?? []).length, 1);

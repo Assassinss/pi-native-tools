@@ -8,7 +8,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import { GrepOutputMode, grep, type GrepMatch } from "./omp-native.ts";
-import { basename } from "node:path";
+import { basename, relative, resolve } from "node:path";
 import { stat } from "node:fs/promises";
 import { normalizePath, toolError } from "./shared.ts";
 
@@ -39,11 +39,12 @@ const grepSchema = Type.Object(
 		limit: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum number of matches to return (default: 100). Must be >= 1." })),
 		mode: Type.Optional(
 			Type.Union([
+				Type.Literal("locations"),
 				Type.Literal("content"),
 				Type.Literal("count"),
 				Type.Literal("filesWithMatches"),
 			], {
-				description: "Output mode: content for matching lines, count for per-file match totals, or filesWithMatches for path-only results.",
+				description: "Output mode: locations (default) for compact file:line results, content for matching lines, count for per-file match totals, or filesWithMatches for path-only results.",
 			}),
 		),
 	},
@@ -52,7 +53,11 @@ const grepSchema = Type.Object(
 
 type GrepParams = Static<typeof grepSchema>;
 type GrepMode = NonNullable<GrepParams["mode"]>;
-type GrepUpdate = { content: Array<{ type: "text"; text: string }>; details: GrepToolDetails | undefined };
+type LineRange = { start: number; end: number };
+type GrepDetails = GrepToolDetails & {
+	locations?: Array<{ path: string; ranges: LineRange[] }>;
+};
+type GrepUpdate = { content: Array<{ type: "text"; text: string }>; details: GrepDetails | undefined };
 
 export interface ExecuteGrepOptions extends GrepParams {
 	cwd: string;
@@ -67,8 +72,12 @@ function sanitizeLine(line: string): string {
 	return line.replace(/\r\n/g, "\n").replace(/\r/g, "").replace(/\n$/, "");
 }
 
-function formatMatchPath(matchPath: string, isDirectory: boolean, searchPath: string): string {
-	return isDirectory ? matchPath.replace(/\\/g, "/") : basename(searchPath).replace(/\\/g, "/");
+function formatMatchPath(matchPath: string, isDirectory: boolean, searchPath: string, cwd: string): string {
+	// Native grep returns paths relative to the search root. Return paths relative
+	// to the tool cwd instead, so the result can be passed directly to read.
+	const absoluteMatchPath = isDirectory ? resolve(searchPath, matchPath) : searchPath;
+	const cwdRelativePath = relative(cwd, absoluteMatchPath).replace(/\\/g, "/");
+	return cwdRelativePath || basename(absoluteMatchPath).replace(/\\/g, "/");
 }
 
 type OutputLine = { line: string; isMatch: boolean; nativeTruncated: boolean };
@@ -101,20 +110,63 @@ function resolveNativeMode(mode: GrepMode | undefined): GrepOutputMode {
 		case "filesWithMatches":
 			return GrepOutputMode.FilesWithMatches;
 		default:
+			// locations and content both need one native match record per line;
+			// locations deliberately discard the line text when formatting.
 			return GrepOutputMode.Content;
 	}
 }
 
-function formatGrepOutput(mode: GrepMode, matches: GrepMatch[], isDirectory: boolean, searchPath: string, contextValue: number) {
+function collectLocationRanges(matches: GrepMatch[], contextValue: number): Map<string, LineRange[]> {
+	const files = new Map<string, LineRange[]>();
+	for (const match of matches) {
+		const ranges = files.get(match.path) ?? [];
+		files.set(match.path, ranges);
+		ranges.push({
+			start: Math.max(1, match.lineNumber - contextValue),
+			end: match.lineNumber + contextValue,
+		});
+	}
+
+	for (const ranges of files.values()) {
+		ranges.sort((a, b) => a.start - b.start || a.end - b.end);
+		const merged: LineRange[] = [];
+		for (const range of ranges) {
+			const previous = merged[merged.length - 1];
+			if (previous && range.start <= previous.end + 1) {
+				previous.end = Math.max(previous.end, range.end);
+			} else {
+				merged.push({ ...range });
+			}
+		}
+		ranges.splice(0, ranges.length, ...merged);
+	}
+	return files;
+}
+
+function formatLineRange(range: LineRange): string {
+	return range.start === range.end ? String(range.start) : `${range.start}-${range.end}`;
+}
+
+function formatGrepOutput(mode: GrepMode, matches: GrepMatch[], isDirectory: boolean, searchPath: string, cwd: string, contextValue: number) {
+	if (mode === "locations") {
+		return {
+			// Grouping line numbers by file makes the result directly useful for a
+			// follow-up read({ ranges }) call without sending matching line text.
+			text: [...collectLocationRanges(matches, contextValue)]
+				.map(([matchPath, ranges]) => `${formatMatchPath(matchPath, isDirectory, searchPath, cwd)}:${ranges.map(formatLineRange).join(",")}`)
+				.join("\n"),
+			linesTruncated: false,
+		};
+	}
 	if (mode === "count") {
 		return {
-			text: matches.map((match) => `${formatMatchPath(match.path, isDirectory, searchPath)}: ${match.matchCount ?? 0}`).join("\n"),
+			text: matches.map((match) => `${formatMatchPath(match.path, isDirectory, searchPath, cwd)}: ${match.matchCount ?? 0}`).join("\n"),
 			linesTruncated: false,
 		};
 	}
 	if (mode === "filesWithMatches") {
 		return {
-			text: matches.map((match) => formatMatchPath(match.path, isDirectory, searchPath)).join("\n"),
+			text: matches.map((match) => formatMatchPath(match.path, isDirectory, searchPath, cwd)).join("\n"),
 			linesTruncated: false,
 		};
 	}
@@ -122,7 +174,7 @@ function formatGrepOutput(mode: GrepMode, matches: GrepMatch[], isDirectory: boo
 	const outputLines: string[] = [];
 	let linesTruncated = false;
 	for (const [matchPath, lines] of collectContentLines(matches, contextValue)) {
-		const pathText = formatMatchPath(matchPath, isDirectory, searchPath);
+		const pathText = formatMatchPath(matchPath, isDirectory, searchPath, cwd);
 		for (const [lineNumber, outputLine] of [...lines].sort(([a], [b]) => a - b)) {
 			const truncated = truncateLine(sanitizeLine(outputLine.line), GREP_MAX_LINE_LENGTH);
 			const separator = outputLine.isMatch ? ":" : "-";
@@ -134,7 +186,7 @@ function formatGrepOutput(mode: GrepMode, matches: GrepMatch[], isDirectory: boo
 }
 
 function formatLimitNotice(mode: GrepMode, effectiveLimit: number): string {
-	if (mode === "content") return `${effectiveLimit} matches limit reached. Use limit=${effectiveLimit * 2} for more, or refine pattern`;
+	if (mode === "content" || mode === "locations") return `${effectiveLimit} matches limit reached. Use limit=${effectiveLimit * 2} for more, or refine pattern`;
 	return `${effectiveLimit} results limit reached. Use limit=${effectiveLimit * 2} for more, or refine pattern`;
 }
 
@@ -164,6 +216,7 @@ function buildGrepResponse(
 	matches: GrepMatch[],
 	isDirectory: boolean,
 	searchPath: string,
+	cwd: string,
 	contextValue: number,
 	result?: {
 		limitReached?: boolean;
@@ -173,16 +226,22 @@ function buildGrepResponse(
 	},
 	effectiveLimit?: number,
 ): GrepUpdate {
-	const limited = mode === "content" ? limitContentMatches(matches) : { matches, omitted: 0, omittedFiles: 0 };
-	const formatted = formatGrepOutput(mode, limited.matches, isDirectory, searchPath, contextValue);
+	const limited = mode === "content" || mode === "locations" ? limitContentMatches(matches) : { matches, omitted: 0, omittedFiles: 0 };
+	const formatted = formatGrepOutput(mode, limited.matches, isDirectory, searchPath, cwd, contextValue);
 	const truncation = truncateHead(formatted.text, {
 		maxBytes: MODEL_MAX_BYTES - NOTICE_RESERVE_BYTES,
 		maxLines: MODEL_MAX_LINES - NOTICE_RESERVE_LINES,
 	});
 	let text = truncation.content || "No matches found";
-	const details: GrepToolDetails = {};
+	const details: GrepDetails = {};
+	if (mode === "locations") {
+		details.locations = [...collectLocationRanges(limited.matches, contextValue)].map(([matchPath, ranges]) => ({
+			path: formatMatchPath(matchPath, isDirectory, searchPath, cwd),
+			ranges,
+		}));
+	}
 	const notices: string[] = [];
-	const nativeOmitted = mode === "content" ? Math.max(0, (result?.totalMatches ?? matches.length) - matches.length) : 0;
+	const nativeOmitted = mode === "content" || mode === "locations" ? Math.max(0, (result?.totalMatches ?? matches.length) - matches.length) : 0;
 	const userLimitReached = Boolean(result?.limitReached && effectiveLimit !== undefined && (result?.totalMatches ?? 0) >= effectiveLimit);
 	if (userLimitReached && effectiveLimit !== undefined) {
 		notices.push(formatLimitNotice(mode, effectiveLimit));
@@ -241,9 +300,10 @@ export async function executeGrepNative({
 		});
 	}
 
-	const grepMode = mode ?? "content";
+	const grepMode = mode ?? "locations";
 	const contextValue = context && context > 0 ? context : 0;
 	const effectiveLimit = Math.max(1, limit ?? DEFAULT_LIMIT);
+	const nativeContextValue = grepMode === "locations" ? 0 : contextValue;
 	const nativePattern = literal ? escapeRegex(pattern) : pattern;
 
 	let result;
@@ -257,9 +317,9 @@ export async function executeGrepNative({
 				hidden: true,
 				gitignore: true,
 				maxCount: effectiveLimit,
-				maxCountPerFile: grepMode === "content" ? MAX_MATCHES_PER_FILE : undefined,
-				contextBefore: contextValue,
-				contextAfter: contextValue,
+				maxCountPerFile: grepMode === "content" || grepMode === "locations" ? MAX_MATCHES_PER_FILE : undefined,
+				contextBefore: nativeContextValue,
+				contextAfter: nativeContextValue,
 				maxColumns: GREP_MAX_LINE_LENGTH,
 				mode: resolveNativeMode(grepMode),
 				signal,
@@ -285,21 +345,21 @@ export async function executeGrepNative({
 		throw err;
 	}
 
-	return buildGrepResponse(grepMode, result.matches, isDirectory, searchPath, contextValue, result, effectiveLimit);
+	return buildGrepResponse(grepMode, result.matches, isDirectory, searchPath, cwd, contextValue, result, effectiveLimit);
 }
 
 export function registerGrepTool(pi: ExtensionAPI): void {
 	pi.registerTool({
 		...builtInGrep,
 		description:
-			"Search file contents by regex or literal pattern. Use this when you need matching lines, counts, or files with matches. Respects .gitignore and truncates long lines in output.",
-		promptSnippet: "Search file contents by regex or literal pattern",
+			"Search file contents for a pattern. By default returns compact file:line locations only; pass the result to read with locations to inspect those lines without loading the whole file. Use mode=content when matching text is needed. Respects .gitignore.",
+		promptSnippet: "Locate file matches (use read for exact lines)",
 		promptGuidelines: [
-			"Use grep for regex or literal content searches; set path and glob to narrow the search when useful.",
-			"Use context when the lines surrounding a match are relevant; leave it at 0 for concise results.",
-			"Use mode=filesWithMatches for matching paths and mode=count for per-file match totals.",
-			"Use literal=true for exact text containing regex metacharacters.",
-			"Use read or other tools when you need full file context or additional processing.",
+			"Use path to choose the directory or file to search, and glob to filter files when useful.",
+			"Default mode=locations returns only file paths and matching line numbers, keeping search results compact.",
+			"After locating matches, pass the complete locations output to read with locations, or use ranges for the returned line numbers (and before/after when context is needed) instead of reading the whole file.",
+			"Use mode=content only when the matching text itself is needed; use mode=count for per-file totals or mode=filesWithMatches for paths only.",
+			"Use ignoreCase=true for case-insensitive searches and literal=true to treat the pattern as exact text instead of a regex.",
 		],
 		parameters: grepSchema,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {

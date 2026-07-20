@@ -11,6 +11,7 @@ import {
 	createStatRevisionId,
 	formatSize,
 	getCurrentDocumentRevision,
+	getCompleteDocumentReadKey,
 	getDocumentFingerprint,
 	normalizePath,
 	readFile,
@@ -26,6 +27,11 @@ type ReadRangeRequest = {
 	end?: number;
 	before?: number;
 	after?: number;
+};
+
+type ReadLocation = {
+	path: string;
+	ranges: ReadRangeRequest[];
 };
 
 type NormalizedReadRange = {
@@ -55,7 +61,7 @@ type CollectedReadRangeBlock = {
 	lines: CollectedRangeLine[];
 };
 
-type ReadDetails = ReadToolDetails & { snapshotId?: string };
+type ReadDetails = ReadToolDetails & { snapshotId?: string; snapshots?: Record<string, string> };
 
 const MAX_TEXT_FILE_BYTES = 20 * 1024 * 1024;
 const MAX_IMAGE_FILE_BYTES = 20 * 1024 * 1024;
@@ -170,7 +176,10 @@ const readRangeSchema = Type.Object({
 });
 
 const readSchema = Type.Object({
-	path: Type.String({ description: "Path to the file to read (relative or absolute)" }),
+	path: Type.Optional(Type.String({ description: "Path to the file to read (relative or absolute)" })),
+	locations: Type.Optional(Type.String({
+		description: "Grep locations to read directly, e.g. 'src/main.ts:12,30-34'. Supports one or more lines. Mutually exclusive with path, offset, limit, ranges, and outline.",
+	})),
 	offset: Type.Optional(Type.Integer({ minimum: 1, description: "Line number to start reading from (1-indexed). Must be >= 1." })),
 	limit: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum number of lines to read. Must be >= 1." })),
 	ranges: Type.Optional(
@@ -279,12 +288,53 @@ function finalizeContiguousReadResult(
 	return { content: [{ type: "text", text: finalText }], details };
 }
 
+function parseReadLocations(locations: string): ReadLocation[] {
+	const parsed: ReadLocation[] = [];
+	for (const [index, rawLine] of locations.split(/\r?\n/).entries()) {
+		const line = rawLine.trim();
+		if (!line) continue;
+		const match = /^(.*):((?:\d+(?:-\d+)?)(?:,\d+(?:-\d+)?)*)$/.exec(line);
+		if (!match || !match[1]) {
+			if (line.startsWith("[")) continue;
+			throw readError(
+				"invalid_locations",
+				`Read failed: invalid grep location on line ${index + 1}: ${rawLine}`,
+				"Use locations such as 'src/main.ts:12,30-34'.",
+				{ line: rawLine },
+			);
+		}
+		const ranges = match[2]!.split(",").map((value) => {
+			const [startText, endText] = value.split("-");
+			const start = Number(startText);
+			const end = endText === undefined ? start : Number(endText);
+			return { start, end };
+		});
+		parsed.push({ path: match[1]!, ranges });
+	}
+	if (parsed.length === 0) {
+		throw readError("invalid_locations", "Read failed: no valid grep locations found.", "Use locations such as 'src/main.ts:12,30-34'.");
+	}
+	return parsed;
+}
+
 function validateReadArguments(
+	path: string | undefined,
+	locations: string | undefined,
 	offset: number | undefined,
 	limit: number | undefined,
 	ranges: ReadRangeRequest[] | undefined,
 	_outline: boolean | undefined,
 ): void {
+	if (!path && !locations) {
+		throw readError("invalid_input", "Read failed: path or locations is required.", "Pass path for a normal read, or locations with grep output.");
+	}
+	if (locations && (path || offset !== undefined || limit !== undefined || ranges !== undefined || _outline)) {
+		throw readError(
+			"invalid_input",
+			"Read failed: locations cannot be combined with path, offset, limit, ranges, or outline.",
+			"Pass the grep locations directly as locations, or use path with ranges.",
+		);
+	}
 	if (!ranges || ranges.length === 0) return;
 	if (offset !== undefined || limit !== undefined) {
 		throw readError(
@@ -439,6 +489,20 @@ function sameFingerprint(a: ReturnType<typeof getDocumentFingerprint>, b: { size
 	return a !== undefined && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs && String(a.ino ?? "") === String(b.ino ?? "");
 }
 
+function createCompleteReadKey(
+	offset: number | undefined,
+	limit: number | undefined,
+	ranges: NormalizedReadRange[] | undefined,
+	outline: boolean | undefined,
+): string {
+	return JSON.stringify({
+		offset,
+		limit,
+		ranges: ranges?.map(({ start, end, before, after }) => ({ start, end, before, after })),
+		outline: Boolean(outline),
+	});
+}
+
 export async function executeRead(
 	path: string,
 	offset: number | undefined,
@@ -449,7 +513,7 @@ export async function executeRead(
 	outline?: boolean,
 	force?: boolean,
 ): Promise<{ content: Array<TextContent | ImageContent>; details: ReadDetails | undefined }> {
-	validateReadArguments(offset, limit, ranges, outline);
+	validateReadArguments(path, undefined, offset, limit, ranges, outline);
 	const normalizedRanges = ranges && ranges.length > 0 ? normalizeReadRanges(ranges) : undefined;
 	const absolutePath = normalizePath(path, cwd);
 	throwIfAborted(signal);
@@ -501,8 +565,15 @@ export async function executeRead(
 		};
 	}
 
-	// ponytail: dedup unchanged full re-reads using a complete stat fingerprint.
-	const unchangedRevision = !force && sameFingerprint(getDocumentFingerprint(absolutePath), fileStat) ? getCurrentDocumentRevision(absolutePath) : undefined;
+	// Deduplicate only the same request that previously returned the complete file.
+	// A prior full read must never suppress a later ranges/offset read: those calls
+	// are intentionally used to inspect a small section of the same unchanged file.
+	const completeReadKey = createCompleteReadKey(offset, limit, normalizedRanges, outline);
+	const unchangedRevision = !force &&
+		sameFingerprint(getDocumentFingerprint(absolutePath), fileStat) &&
+		getCompleteDocumentReadKey(absolutePath) === completeReadKey
+		? getCurrentDocumentRevision(absolutePath)
+		: undefined;
 	if (unchangedRevision && !outline) {
 		return {
 			content: [{ type: "text", text: `Content unchanged since your last read (snapshotId: ${unchangedRevision}). Content is already in your context. Use force=true only if you need to re-read.` }],
@@ -538,7 +609,7 @@ export async function executeRead(
 		const startLine = offset ? offset - 1 : 0;
 		return startLine === 0 && (limit === undefined || limit >= contentLineCount);
 	})();
-	rememberDocumentRevision(absolutePath, snapshotId, seedsFingerprint ? fileStat : undefined);
+	rememberDocumentRevision(absolutePath, snapshotId, seedsFingerprint ? fileStat : undefined, seedsFingerprint ? completeReadKey : undefined);
 
 	if (outline) {
 		const outlineText = formatOutline(buildOutline(rawContent, path), path);
@@ -561,29 +632,57 @@ export async function executeRead(
 	return finalizeContiguousReadResult(selected.text, snapshotId, startLine, selected.totalLines, limit);
 }
 
+async function executeReadLocations(
+	locations: string,
+	signal: AbortSignal | undefined,
+	cwd: string,
+	force?: boolean,
+): Promise<{ content: TextContent[]; details: ReadDetails | undefined }> {
+	const parsed = parseReadLocations(locations);
+	const parts: string[] = [];
+	const snapshots: Record<string, string> = {};
+	for (const location of parsed) {
+		const result = await executeRead(location.path, undefined, undefined, signal, cwd, location.ranges, undefined, force);
+		const text = result.content
+			.filter((item): item is TextContent => item.type === "text")
+			.map((item) => item.text)
+			.join("\n");
+		if (text) parts.push(`[${location.path}]\n${text}`);
+		const snapshotId = result.details?.snapshotId;
+		if (snapshotId) snapshots[location.path] = snapshotId;
+	}
+	return {
+		content: [{ type: "text", text: parts.join("\n\n") || "No locations found" }],
+		details: Object.keys(snapshots).length > 0 ? { snapshots } : undefined,
+	};
+}
+
 export function registerReadTool(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "read",
 		label: "read",
-		description: `Read text files and images up to ${MAX_TEXT_FILE_BYTES / (1024 * 1024)}MB (jpg, png, gif, webp, bmp). Images are sent as attachments. Text output is truncated to ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB. Use offset/limit for large files, or ranges for explicit line windows with optional context.`,
+		description: `Read text files and images up to ${MAX_TEXT_FILE_BYTES / (1024 * 1024)}MB (jpg, png, gif, webp, bmp). Images are sent as attachments. Text output is truncated to ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB. Use offset/limit for large files, ranges for explicit line windows, or locations to read grep output directly.`,
 		promptSnippet: "Read file contents",
 		promptGuidelines: [
 			"Read is the primary way to inspect file contents. When the user names a file or you need its text, read it directly — don't grep or find first.",
 			"Every read returns a snapshotId — copy it to your next edit. After editing, the result gives a new snapshotId; use that directly, no re-read needed.",
-			"Use ranges for specific line windows, outline=true to discover file structure (declarations + line numbers). Combine both in one call to see structure and read key sections simultaneously.",
+			"Use ranges for specific line windows; when grep returns file:line or file:start-end locations, pass the complete grep output as locations, or convert it to ranges. Use outline=true to discover file structure (declarations + line numbers). Combine both in one call to see structure and read key sections simultaneously.",
 			"Re-reading the same file with the same parameters returns a cached result. Only re-read when edit signals stale_snapshot or ambiguous match.",
 		],
 		parameters: readSchema,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			const { path, offset, limit, ranges, outline, force } = params as {
-				path: string;
+			const { path, locations, offset, limit, ranges, outline, force } = params as {
+				path?: string;
+				locations?: string;
 				offset?: number;
 				limit?: number;
 				ranges?: ReadRangeRequest[];
 				outline?: boolean;
 				force?: boolean;
 			};
-			return executeRead(path, offset, limit, signal, ctx?.cwd ?? process.cwd(), ranges, outline, force);
+			const cwd = ctx?.cwd ?? process.cwd();
+			if (locations !== undefined) return executeReadLocations(locations, signal, cwd, force);
+			return executeRead(path!, offset, limit, signal, cwd, ranges, outline, force);
 		},
 	});
 }

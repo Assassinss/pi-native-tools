@@ -188,6 +188,24 @@ test("executeRead force bypasses dedup", async () => {
 	}
 });
 
+test("executeRead ranges are not blocked after a complete read", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-read-full-then-range-"));
+	try {
+		const file = join(dir, "demo.ts");
+		await writeFile(file, "before\nneedle target\nafter\n", "utf-8");
+
+		const full = await executeRead(file, undefined, undefined, undefined, dir, undefined, undefined, undefined);
+		assert.match(extractText(full), /needle target/);
+
+		const range = await executeRead(file, undefined, undefined, undefined, dir, [{ start: 2, end: 2 }], undefined, undefined);
+		const rangeText = extractText(range);
+		assert.match(rangeText, /2\|needle target/);
+		assert.doesNotMatch(rangeText, /Content unchanged/);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
 test("executeRead outline does not seed mtime for dedup (ranges after outline reads content)", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-read-outline-no-mtime-"));
 	try {

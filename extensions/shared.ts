@@ -93,6 +93,7 @@ export type DocumentFingerprint = {
 type DocumentHistory = {
   currentRevisionId: string;
   fingerprint?: DocumentFingerprint;
+  completeReadKey?: string;
 };
 
 const documentHistories = new Map<string, DocumentHistory>();
@@ -111,17 +112,23 @@ export function rememberDocumentRevision(
   absolutePath: string,
   revisionId: string,
   fingerprint?: DocumentFingerprint,
+  completeReadKey?: string,
 ): string {
   let history = documentHistories.get(absolutePath);
   if (!history) {
     history = {
       currentRevisionId: revisionId,
       fingerprint,
+      completeReadKey,
     };
     documentHistories.set(absolutePath, history);
+    return revisionId;
   }
+
+  if (history.currentRevisionId !== revisionId) history.completeReadKey = undefined;
   history.currentRevisionId = revisionId;
   if (fingerprint !== undefined) history.fingerprint = { ...fingerprint };
+  if (completeReadKey !== undefined) history.completeReadKey = completeReadKey;
   return revisionId;
 }
 
@@ -133,6 +140,10 @@ export function getCurrentDocumentRevision(
 
 export function getDocumentFingerprint(absolutePath: string): DocumentFingerprint | undefined {
   return documentHistories.get(absolutePath)?.fingerprint;
+}
+
+export function getCompleteDocumentReadKey(absolutePath: string): string | undefined {
+  return documentHistories.get(absolutePath)?.completeReadKey;
 }
 
 export function normalizePath(path: string, cwd: string): string {

@@ -23,9 +23,22 @@ if you already have a file name, use `read` directly.
 
 ### grep
 
-Native in-process search with regex, literal, context, count, and files-with-matches modes. Use
-only to search across files for patterns, symbols, or definitions — never as a substitute for
-reading a file. Accepts `output_mode` and `outputMode` as aliases for `mode`.
+Native in-process search with regex, literal, context, locations, content, count, and
+files-with-matches modes. The default `locations` mode returns compact `file:line` results (grouped
+as `file:start-end`) without copying matching source text into context. Use the returned line
+numbers with `read` and `ranges` to inspect only the relevant sections, for example:
+
+```text
+grep({ pattern: "needle", path: "." })
+→ src/main.ts:12,30-34
+read({ locations: "src/main.ts:12,30-34" })
+// or: read({ path: "src/main.ts", ranges: [{ start: 12 }, { start: 30, end: 34 }] })
+```
+
+Pass the complete locations output to `read({ locations })` to inspect the reported ranges directly.
+Use `mode: "content"` when the matching text itself is needed. Use `context` with locations to
+expand each returned line into a directly readable line range. Use grep only to search across
+files for patterns, symbols, or definitions — never as a substitute for reading a file.
 
 ### read
 
@@ -33,8 +46,9 @@ Read file contents. The primary way to inspect files — when you know the file 
 directly, don't `grep` or `find` first. Returns a `snapshotId` at the end of its output text for
 use with `edit`.
 
-Parameters: `path`, `offset` / `limit`, explicit `ranges` with optional `before`/`after` context,
-`outline`, `force`, binary/NUL rejection, and large-file streaming.
+Parameters: `path`, `locations`, `offset` / `limit`, explicit `ranges` with optional `before`/`after` context,
+`outline`, `force`, binary/NUL rejection, and large-file streaming. After grep locates a symbol,
+prefer `ranges` around its reported line instead of reading the complete file.
 
 **`outline`** — returns a structural outline (function/class/type declarations with line numbers)
 instead of full content. Supports TS/JS/Python/Rust/Go/Java/C/C++/Markdown/JSON/YAML via regex
