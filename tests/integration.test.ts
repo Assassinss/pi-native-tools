@@ -1,9 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, realpath, truncate, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { STREAMING_THRESHOLD } from "../extensions/shared.ts";
 import { clearBashSessions, getBashSessionCount } from "../extensions/bash.ts";
 import extension from "../index.ts";
 
@@ -46,125 +45,24 @@ test("registered tools work end-to-end through extension entry", async () => {
 	try {
 		const pi = createPiStub();
 		extension(pi as any);
-		const read = pi.tools.get("read");
 		const write = pi.tools.get("write");
-		const edit = pi.tools.get("edit");
-		assert.ok(read);
+		const grep = pi.tools.get("grep");
 		assert.ok(write);
-		assert.ok(edit);
+		assert.ok(grep);
 
 		const file = join(dir, "e2e.txt");
 		await write!.execute("1", { path: file, content: "alpha beta gamma" }, undefined, undefined, { cwd: dir });
-		const readResult = await read!.execute("2", { path: file, offset: 1, limit: 1 }, undefined, undefined, { cwd: dir });
-		const snapshotId = (readResult.details as { snapshotId?: string } | undefined)?.snapshotId;
-		assert.ok(snapshotId);
-
-		const editResult = await edit!.execute(
-			"3",
-			{ path: file, snapshotId, oldText: "alpha beta gamma", newText: "alpha delta gamma" },
+		const grepResult = await grep!.execute(
+			"2",
+			{ pattern: "beta", path: dir, mode: "content" },
 			undefined,
 			undefined,
 			{ cwd: dir },
 		);
-		assert.match(extractText(editResult), /Applied 1 replacement/);
+		assert.match(extractText(grepResult), /alpha beta gamma/);
 
 		const finalContent = await readFile(file, "utf-8");
-		assert.equal(finalContent, "alpha delta gamma");
-	} finally {
-		await rm(dir, { recursive: true, force: true });
-	}
-});
-
-test("registered edit applies snapshot-based exact replacement", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-"));
-	try {
-		const pi = createPiStub();
-		extension(pi as any);
-		const read = pi.tools.get("read");
-		const write = pi.tools.get("write");
-		const edit = pi.tools.get("edit");
-		assert.ok(read);
-		assert.ok(write);
-		assert.ok(edit);
-
-		const file = join(dir, "edit.txt");
-		await write!.execute("1", { path: file, content: "first\nsecond\nthird\n" }, undefined, undefined, { cwd: dir });
-		const readResult = await read!.execute("2", { path: file, offset: 2, limit: 1 }, undefined, undefined, { cwd: dir });
-		const snapshotId = (readResult.details as { snapshotId?: string } | undefined)?.snapshotId;
-		assert.ok(snapshotId);
-
-		await edit!.execute(
-			"3",
-			{ path: file, snapshotId, oldText: "second", newText: "SECOND" },
-			undefined,
-			undefined,
-			{ cwd: dir },
-		);
-
-		const finalContent = await readFile(file, "utf-8");
-		assert.equal(finalContent, "first\nSECOND\nthird\n");
-	} finally {
-		await rm(dir, { recursive: true, force: true });
-	}
-});
-
-test("registered edit returns ambiguous conflicts with previews", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-tools-edit-ambiguous-"));
-	try {
-		const pi = createPiStub();
-		extension(pi as any);
-		const edit = pi.tools.get("edit");
-		const write = pi.tools.get("write");
-		assert.ok(edit);
-		assert.ok(write);
-
-		const file = join(dir, "ambiguous.txt");
-		await write!.execute("1", { path: file, content: "x\nrepeat\ny\nrepeat\n" }, undefined, undefined, { cwd: dir });
-		const result = await edit!.execute(
-			"2",
-			{ path: file, oldText: "repeat", newText: "done" },
-			undefined,
-			undefined,
-			{ cwd: dir },
-		);
-		const details = result.details as { status?: string; reason?: string; candidates?: Array<{ preview: string }> } | undefined;
-		assert.equal(details?.status, "conflict");
-		assert.equal(details?.reason, "ambiguous");
-		assert.ok(details?.candidates?.length);
-	} finally {
-		await rm(dir, { recursive: true, force: true });
-	}
-});
-
-test("registered read supports explicit ranges with context", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-tools-read-ranges-integration-"));
-	try {
-		const pi = createPiStub();
-		extension(pi as any);
-		const read = pi.tools.get("read");
-		const write = pi.tools.get("write");
-		assert.ok(read);
-		assert.ok(write);
-
-		const file = join(dir, "ranges.txt");
-		await write!.execute(
-			"1",
-			{ path: file, content: Array.from({ length: 10 }, (_, i) => `line-${i + 1}`).join("\n") },
-			undefined,
-			undefined,
-			{ cwd: dir },
-		);
-		const result = await read!.execute(
-			"2",
-			{ path: file, ranges: [{ start: 4, end: 5, before: 1, after: 1 }] },
-			undefined,
-			undefined,
-			{ cwd: dir },
-		);
-		const text = extractText(result);
-		assert.match(text, /\[lines 3-6 \| requested lines 4-5 \| context -1\/\+1\]/);
-		assert.match(text, /3\|line-3/);
-		assert.match(text, /6\|line-6/);
+		assert.equal(finalContent, "alpha beta gamma");
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
@@ -176,11 +74,9 @@ test("registered native find and grep work end-to-end", async () => {
 		const pi = createPiStub();
 		extension(pi as any);
 		const write = pi.tools.get("write");
-		const read = pi.tools.get("read");
 		const find = pi.tools.get("find");
 		const grep = pi.tools.get("grep");
 		assert.ok(write);
-		assert.ok(read);
 		assert.ok(find);
 		assert.ok(grep);
 
@@ -200,14 +96,14 @@ test("registered native find and grep work end-to-end", async () => {
 		assert.equal(extractText(grepResult).trim(), "src/main.ts:1");
 		assert.doesNotMatch(extractText(grepResult), /const needle/);
 
-		const readResult = await read!.execute(
+		const contentResult = await grep!.execute(
 			"5",
-			{ path: "src/main.ts", ranges: [{ start: 1, end: 1 }] },
+			{ pattern: "needle", path: join(dir, "src"), glob: "*.ts", mode: "content" },
 			undefined,
 			undefined,
 			{ cwd: dir },
 		);
-		assert.match(extractText(readResult), /1\|const needle = 1;/);
+		assert.match(extractText(contentResult), /1: const needle = 1;/);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
@@ -308,15 +204,13 @@ test("registered native grep distributes matches across files", async () => {
 	}
 });
 
-test("registered native grep groups locations and read can inspect the returned ranges", async () => {
+test("registered native grep groups locations", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-tools-native-grep-locations-"));
 	try {
 		const pi = createPiStub();
 		extension(pi as any);
 		const grep = pi.tools.get("grep");
-		const read = pi.tools.get("read");
 		assert.ok(grep);
-		assert.ok(read);
 		const file = join(dir, "locations.ts");
 		await writeFile(file, "zero\nneedle one\ntwo\nneedle two\nlast\n", "utf-8");
 
@@ -324,31 +218,6 @@ test("registered native grep groups locations and read can inspect the returned 
 		const locationText = extractText(locations);
 		assert.equal(locationText.trim(), "locations.ts:2,4");
 		assert.deepEqual((locations.details as { locations?: unknown })?.locations, [{ path: "locations.ts", ranges: [{ start: 2, end: 2 }, { start: 4, end: 4 }] }]);
-
-		const direct = await read!.execute(
-			"2a",
-			{ locations: locationText },
-			undefined,
-			undefined,
-			{ cwd: dir },
-		);
-		const directText = extractText(direct);
-		assert.match(directText, /\[locations\.ts\]/);
-		assert.match(directText, /2\|needle one/);
-		assert.match(directText, /4\|needle two/);
-		assert.doesNotMatch(directText, /1\|zero|3\|two|5\|last/);
-
-		const selected = await read!.execute(
-			"2",
-			{ path: file, ranges: [{ start: 2 }, { start: 4 }] },
-			undefined,
-			undefined,
-			{ cwd: dir },
-		);
-		const selectedText = extractText(selected);
-		assert.match(selectedText, /2\|needle one/);
-		assert.match(selectedText, /4\|needle two/);
-		assert.doesNotMatch(selectedText, /0\|zero|5\|last/);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
@@ -382,64 +251,6 @@ test("registered native grep reports missing paths with a structured code", asyn
 		await assert.rejects(
 			grep!.execute("1", { pattern: "needle", path: join(dir, "missing") }, undefined, undefined, { cwd: dir }),
 			/path_not_found/,
-		);
-	} finally {
-		await rm(dir, { recursive: true, force: true });
-	}
-});
-
-test("registered read reports offset past EOF", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-tools-read-eof-"));
-	try {
-		const pi = createPiStub();
-		extension(pi as any);
-		const read = pi.tools.get("read");
-		assert.ok(read);
-
-		const file = join(dir, "read-eof.txt");
-		await writeFile(file, "line-1\nline-2\nline-3", "utf-8");
-		const result = await read!.execute("1", { path: file, offset: 5, limit: 1 }, undefined, undefined, { cwd: dir });
-		const text = extractText(result);
-		assert.match(text, /Line 5 is beyond end of file \(3 lines total\)/);
-		assert.match(text, /snapshotId: rev_/);
-	} finally {
-		await rm(dir, { recursive: true, force: true });
-	}
-});
-
-test("registered read preserves utf-8 characters", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-tools-read-utf8-"));
-	try {
-		const pi = createPiStub();
-		extension(pi as any);
-		const read = pi.tools.get("read");
-		assert.ok(read);
-
-		const file = join(dir, "read-utf8.txt");
-		await writeFile(file, "prefix\nx你\nsuffix", "utf-8");
-		const result = await read!.execute("1", { path: file, offset: 2, limit: 1 }, undefined, undefined, { cwd: dir });
-		const text = extractText(result);
-		assert.match(text, /^x你/m);
-		assert.doesNotMatch(text, /\u0000|\uFFFD/);
-	} finally {
-		await rm(dir, { recursive: true, force: true });
-	}
-});
-
-test("registered read rejects text files over 20MB", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-tools-read-too-large-"));
-	try {
-		const pi = createPiStub();
-		extension(pi as any);
-		const read = pi.tools.get("read");
-		assert.ok(read);
-
-		const file = join(dir, "too-large.txt");
-		await writeFile(file, "", "utf-8");
-		await truncate(file, 20 * 1024 * 1024 + 1);
-		await assert.rejects(
-			read!.execute("1", { path: file }, undefined, undefined, { cwd: dir }),
-			/file_too_large/,
 		);
 	} finally {
 		await rm(dir, { recursive: true, force: true });

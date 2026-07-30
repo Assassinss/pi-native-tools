@@ -17,11 +17,11 @@ function createPiStub() {
 	};
 }
 
-test("extension entry registers bash/read/edit/write/find/grep", () => {
+test("extension entry registers bash/write/find/grep", () => {
 	const pi = createPiStub();
 	extension(pi as any);
 	assert.deepEqual(
 		pi.tools.map((tool) => tool.name).sort(),
-		["bash", "edit", "find", "grep", "read", "write"],
+		["bash", "find", "grep", "write"],
 	);
 });
