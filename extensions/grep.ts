@@ -147,12 +147,13 @@ function formatLineRange(range: LineRange): string {
 	return range.start === range.end ? String(range.start) : `${range.start}-${range.end}`;
 }
 
-function formatGrepOutput(mode: GrepMode, matches: GrepMatch[], isDirectory: boolean, searchPath: string, cwd: string, contextValue: number) {
+function formatGrepOutput(mode: GrepMode, matches: GrepMatch[], isDirectory: boolean, searchPath: string, cwd: string, contextValue: number, locationRanges?: Map<string, LineRange[]>) {
 	if (mode === "locations") {
+		const ranges = locationRanges ?? collectLocationRanges(matches, contextValue);
 		return {
 			// Grouping line numbers by file makes the result directly useful for a
 			// follow-up read({ ranges }) call without sending matching line text.
-			text: [...collectLocationRanges(matches, contextValue)]
+			text: [...ranges]
 				.map(([matchPath, ranges]) => `${formatMatchPath(matchPath, isDirectory, searchPath, cwd)}:${ranges.map(formatLineRange).join(",")}`)
 				.join("\n"),
 			linesTruncated: false,
@@ -202,6 +203,8 @@ function limitContentMatches(matches: GrepMatch[]): { matches: GrepMatch[]; omit
 		if (limited.length >= MAX_MATCHES || (!files.has(match.path) && files.size >= MAX_MATCH_FILES) || fileMatches >= MAX_MATCHES_PER_FILE) {
 			omitted++;
 			omittedFiles.add(match.path);
+			// Early exit when all limits are exhausted
+			if (limited.length >= MAX_MATCHES) break;
 			continue;
 		}
 		files.add(match.path);
@@ -227,15 +230,16 @@ function buildGrepResponse(
 	effectiveLimit?: number,
 ): GrepUpdate {
 	const limited = mode === "content" || mode === "locations" ? limitContentMatches(matches) : { matches, omitted: 0, omittedFiles: 0 };
-	const formatted = formatGrepOutput(mode, limited.matches, isDirectory, searchPath, cwd, contextValue);
+	const locationRanges = mode === "locations" ? collectLocationRanges(limited.matches, contextValue) : undefined;
+	const formatted = formatGrepOutput(mode, limited.matches, isDirectory, searchPath, cwd, contextValue, locationRanges);
 	const truncation = truncateHead(formatted.text, {
 		maxBytes: MODEL_MAX_BYTES - NOTICE_RESERVE_BYTES,
 		maxLines: MODEL_MAX_LINES - NOTICE_RESERVE_LINES,
 	});
 	let text = truncation.content || "No matches found";
 	const details: GrepDetails = {};
-	if (mode === "locations") {
-		details.locations = [...collectLocationRanges(limited.matches, contextValue)].map(([matchPath, ranges]) => ({
+	if (mode === "locations" && locationRanges) {
+		details.locations = [...locationRanges].map(([matchPath, ranges]) => ({
 			path: formatMatchPath(matchPath, isDirectory, searchPath, cwd),
 			ranges,
 		}));
@@ -252,7 +256,8 @@ function buildGrepResponse(
 		const matchesPerFile = new Map<string, number>();
 		for (const match of matches) matchesPerFile.set(match.path, (matchesPerFile.get(match.path) ?? 0) + 1);
 		const filesAtPerFileLimit = [...matchesPerFile.values()].filter((count) => count >= MAX_MATCHES_PER_FILE).length;
-		const omittedFiles = Math.max(limited.omittedFiles, filesAtPerFileLimit, result?.filesWithMatches && matches.length === 0 ? result.filesWithMatches : 0);
+		const resultFilesWithMatches = (result?.filesWithMatches && matches.length === 0) ? result.filesWithMatches : 0;
+		const omittedFiles = Math.max(limited.omittedFiles, filesAtPerFileLimit, resultFilesWithMatches);
 		const qualifier = nativeOmitted > 0 ? "At least " : "";
 		const matchLabel = omitted === 1 ? "match" : "matches";
 		const fileLabel = omittedFiles === 1 ? "file" : "files";
@@ -303,7 +308,7 @@ export async function executeGrepNative({
 	const grepMode = mode ?? "locations";
 	const contextValue = context && context > 0 ? context : 0;
 	const effectiveLimit = Math.max(1, limit ?? DEFAULT_LIMIT);
-	const nativeContextValue = grepMode === "locations" ? 0 : contextValue;
+	const nativeContextValue = contextValue;
 	const nativePattern = literal ? escapeRegex(pattern) : pattern;
 
 	let result;

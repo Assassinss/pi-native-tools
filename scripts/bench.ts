@@ -87,8 +87,20 @@ async function time<T>(fn: () => Promise<T>): Promise<{ ms: number; value: T; me
 	}, 10);
 	timer.unref?.();
 	const start = performance.now();
+	// Safety timeout: if the benchmark hangs for >60s, abort
+	const safetyController = new AbortController();
+	const safetyTimeout = setTimeout(() => {
+		safetyController.abort();
+		clearInterval(timer);
+	}, 60_000);
+	safetyTimeout.unref?.();
 	try {
-		const value = await fn();
+		const value = await Promise.race([
+			fn(),
+			new Promise<never>((_, reject) => {
+				safetyController.signal.addEventListener("abort", () => reject(new Error("Benchmark timed out after 60s")), { once: true });
+			}),
+		]);
 		const after = snapshotMemory();
 		peakRss = Math.max(peakRss, after.rss);
 		peakHeapUsed = Math.max(peakHeapUsed, after.heapUsed);
@@ -102,6 +114,7 @@ async function time<T>(fn: () => Promise<T>): Promise<{ ms: number; value: T; me
 		};
 	} finally {
 		clearInterval(timer);
+		clearTimeout(safetyTimeout);
 	}
 }
 

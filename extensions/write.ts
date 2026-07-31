@@ -111,7 +111,12 @@ export async function executeWrite(
 				}
 				throw writeError("write_failed", `Failed to write ${path}: ${err.message}`, undefined, { path });
 			}
-			throwIfAborted(signal);
+			// If aborted after write, delete the file to prevent silent data loss
+			if (signal?.aborted) {
+				const { rm } = await import("node:fs/promises");
+				await rm(absolutePath, { force: true }).catch(() => {});
+				throw writeError("aborted", "Operation aborted", "Retry the write if cancellation was unintended.", { path });
+			}
 			const writtenStat = await stat(absolutePath);
 			const writtenHash = fullHash(contentBuffer);
 			const markedExecutable = await maybeMarkExecutable(absolutePath, path, cleanContent);

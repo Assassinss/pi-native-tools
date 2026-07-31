@@ -6,7 +6,7 @@ import {
   stat,
   writeFile as fsWriteFile,
 } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { dirname, resolve, sep } from "node:path";
 import {
   DEFAULT_MAX_BYTES,
   formatSize,
@@ -39,8 +39,20 @@ export function fullHash(content: string | Buffer): string {
 
 export function normalizePath(path: string, cwd: string): string {
   let p = path;
-  if (p.startsWith("@")) p = p.slice(1);
-  return resolve(cwd, p);
+  // Windows ADS syntax: file:@stream — strip only when "@" is the first char
+  // and the second char is not alphanumeric (not a scoped package path).
+  if (p.startsWith("@") && p.length > 1 && !/^@[a-zA-Z0-9]/.test(p)) {
+    p = p.slice(1);
+  }
+  const resolved = resolve(cwd, p);
+  // Sandbox: ensure resolved path stays within the project directory (cwd).
+  // Allow exact cwd itself and paths beneath it.
+  const cwdResolved = resolve(cwd);
+  const cwdRoot = cwdResolved.endsWith(sep) ? cwdResolved : cwdResolved + sep;
+  if (resolved !== cwdResolved && !resolved.startsWith(cwdRoot)) {
+    throw new Error(`Path ${path} resolves outside the working directory (${cwd})`);
+  }
+  return resolved;
 }
 
 export type ToolErrorPayload = {

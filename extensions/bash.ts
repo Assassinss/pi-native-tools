@@ -58,6 +58,11 @@ function defaultTempFilePath(prefix: string): string {
 	return join(tmpdir(), `${prefix}-${id}.log`);
 }
 
+function maskPath(path: string): string {
+	const tmp = tmpdir().replace(/\\/g, "/");
+	return path.replace(tmp, "$TMPDIR");
+}
+
 function byteLength(text: string): number {
 	return Buffer.byteLength(text, "utf-8");
 }
@@ -72,8 +77,6 @@ const RESULT_COMMANDS = new Set([
 	"whoami",
 	"hostname",
 	"date",
-	"env",
-	"printenv",
 	"uname",
 	"id",
 	"ls",
@@ -301,6 +304,10 @@ function splitShellCommands(command: string): string[][] {
 			continue;
 		}
 		if (character === "\n" || character === "\r") {
+			// Skip \n when it follows \r to avoid double-flushing \r\n sequences
+			if (character === "\n" && command[index - 1] === "\r") {
+				continue;
+			}
 			flushSegment();
 			continue;
 		}
@@ -540,7 +547,7 @@ function classifyInterpreter(name: string, args: string[], depth: number): Segme
 }
 
 function classifyPip(args: string[]): SegmentPolicy {
-	if (args.some((arg) => ["--version", "-V", "-v", "--help", "-h"].includes(arg.toLowerCase()))) return "result";
+	if (args.some((arg) => ["--version", "-V", "--help", "-h"].includes(arg.toLowerCase()))) return "result";
 	const subcommand = args.find((arg) => !arg.startsWith("-"))?.toLowerCase();
 	if (["install", "download", "wheel", "sync"].includes(subcommand ?? "")) return "progress";
 	if (["check"].includes(subcommand ?? "")) return "diagnostic";
@@ -595,6 +602,7 @@ function classifySegment(words: string[], depth: number): SegmentPolicy {
 	if (DIAGNOSTIC_COMMANDS.has(name)) return "diagnostic";
 	const buildPolicy = classifyBuildTool(name, args);
 	if (buildPolicy) return buildPolicy;
+	if (name === "env" || name === "printenv") return "passthrough";
 	if (RESULT_COMMANDS.has(name)) return "result";
 	return "passthrough";
 }
@@ -624,7 +632,7 @@ function compactOutput(text: string): string {
 	for (const rawLine of ansiStripped.split("\n")) {
 		// Progress indicators commonly redraw the same line with carriage returns.
 		const refreshed = rawLine.split("\r").filter(Boolean).at(-1) ?? "";
-		if (refreshed.trim() || lines.at(-1)?.trim()) lines.push(refreshed);
+		if (refreshed.trim() || (lines.length > 0 && lines.at(-1)?.trim())) lines.push(refreshed);
 	}
 
 	const compacted: string[] = [];
@@ -674,7 +682,12 @@ class OutputAccumulator {
 		this.appendDecodedText(text);
 		if (this.tempFileStream || this.shouldUseTempFile()) {
 			this.ensureTempFile();
-			this.tempFileStream?.write(data);
+			if (this.tempFileError) {
+				// Temp file stream errored — fall back to in-memory buffering
+				this.rawChunks.push(data);
+			} else {
+				this.tempFileStream?.write(data);
+			}
 		} else if (data.length > 0) {
 			this.rawChunks.push(data);
 		}
@@ -721,7 +734,7 @@ class OutputAccumulator {
 		this.tempFileStream = undefined;
 		if (this.tempFileError || stream.destroyed) {
 			stream.destroy();
-			throw this.tempFileError ?? new Error(`Failed to write full command output to ${this.tempFilePath}`);
+			throw this.tempFileError ?? bashError("temp_file_error", `Failed to write full command output to ${this.tempFilePath}`);
 		}
 		await new Promise<void>((resolve, reject) => {
 			const cleanup = () => {
@@ -730,7 +743,7 @@ class OutputAccumulator {
 			};
 			const onError = (error: Error) => {
 				cleanup();
-				reject(error);
+				reject(bashError("temp_file_error", `Failed to write full command output: ${error.message}`));
 			};
 			const onFinish = () => {
 				cleanup();
@@ -751,12 +764,8 @@ class OutputAccumulator {
 		this.tailBytes += bytes;
 		if (this.tailBytes > this.maxRollingBytes * 2) this.trimTail();
 
-		let newlines = 0;
-		let lastNewline = -1;
-		for (let i = text.indexOf("\n"); i !== -1; i = text.indexOf("\n", i + 1)) {
-			newlines++;
-			lastNewline = i;
-		}
+		const newlines = text.split("\n").length - 1;
+		const lastNewline = newlines > 0 ? text.lastIndexOf("\n") : -1;
 		if (newlines === 0) {
 			this.currentLineBytes += bytes;
 			this.hasOpenLine = true;
@@ -859,17 +868,18 @@ function formatOutput(snapshot: OutputSnapshot, command: string, successful: boo
 	const truncation = snapshot.truncation;
 	const compacted = compactOutput(snapshot.content);
 	let text = summarizeDiagnosticOutput(compacted, classifyCommand(command), successful) || emptyText;
+	const maskedPath = snapshot.fullOutputPath ? maskPath(snapshot.fullOutputPath) : undefined;
 	let details: BashToolDetails | undefined;
 	if (truncation.truncated) {
 		details = { truncation, fullOutputPath: snapshot.fullOutputPath };
 		const startLine = truncation.totalLines - truncation.outputLines + 1;
 		const endLine = truncation.totalLines;
 		if (truncation.lastLinePartial) {
-			text += `\n\n[Showing last ${formatSize(truncation.outputBytes)} of line ${endLine}. Full output: ${snapshot.fullOutputPath}]`;
+			text += `\n\n[Showing last ${formatSize(truncation.outputBytes)} of line ${endLine}. Full output: ${maskedPath}]`;
 		} else if (truncation.truncatedBy === "lines") {
-			text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines}. Full output: ${snapshot.fullOutputPath}]`;
+			text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines}. Full output: ${maskedPath}]`;
 		} else {
-			text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines} (${formatSize(MODEL_MAX_BYTES)} limit). Full output: ${snapshot.fullOutputPath}]`;
+			text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines} (${formatSize(MODEL_MAX_BYTES)} limit). Full output: ${maskedPath}]`;
 		}
 	}
 	return { text, details };
@@ -917,7 +927,7 @@ export async function executeBashNative(
 	let shell = useSession ? shellSessions.get(sessionKey) : undefined;
 	if (!shell && useSession) {
 		shell = new Shell();
-		shellSessions.set(sessionKey, shell);
+		// Defer registration until after we're past init risks
 	}
 	if (shell) clearShellSessionEviction(sessionKey);
 
@@ -963,6 +973,9 @@ export async function executeBashNative(
 
 	try {
 		onUpdate?.({ content: [], details: undefined });
+		if (shell && !shellSessions.has(sessionKey)) {
+			shellSessions.set(sessionKey, shell);
+		}
 		if (shell) shellSessionsInUse.add(sessionKey);
 		const callback = (error: Error | null, chunk: string | null) => {
 			if (!acceptingOutput || error || !chunk) return;

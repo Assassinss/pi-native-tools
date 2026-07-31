@@ -7,7 +7,7 @@ import {
 	truncateHead,
 } from "@earendil-works/pi-coding-agent";
 import { FileType, glob } from "./omp-native.ts";
-import path, { basename } from "node:path";
+import path, { basename, relative } from "node:path";
 import { lstat } from "node:fs/promises";
 import { normalizePath, toolError } from "./shared.ts";
 
@@ -71,7 +71,8 @@ export async function executeFindNative(
 		const name = basename(searchPath).replace(/\\/g, "/");
 		const matches = path.matchesGlob(name, pattern) ? [name] : [];
 		if (matches.length === 0) return { content: [{ type: "text", text: "No files found matching pattern" }] };
-		return { content: [{ type: "text", text: matches[0] }], details: undefined };
+		const relativePath = relative(cwd, searchPath).replace(/\\/g, "/");
+		return { content: [{ type: "text", text: relativePath }], details: undefined };
 	}
 	if (!searchStat.isDirectory()) {
 		throw findError("path_not_directory", `Path is not a directory: ${searchPath}`, "Pass a directory path when searching recursively.", { path: searchPath });
@@ -88,9 +89,6 @@ export async function executeFindNative(
 			maxResults: effectiveLimit,
 			sortByMtime: true,
 			signal,
-		},
-		(error, match) => {
-			if (error || !match?.path || isIgnoredDefaultPath(match.path)) return;
 		},
 	);
 	const relativePaths = result.matches
