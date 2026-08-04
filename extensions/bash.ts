@@ -555,6 +555,143 @@ function classifyPip(args: string[]): SegmentPolicy {
 	return "passthrough";
 }
 
+function classifyDotnet(args: string[]): SegmentPolicy {
+	const index = firstCommandIndex(args, new Set(["-p", "--project", "-c", "--configuration", "-f", "--framework", "-r", "--runtime", "--self-contained", "--no-restore", "--no-build"]));
+	const subcommand = args[index]?.toLowerCase();
+	if (!subcommand || ["--help", "-h", "--version", "-V", "--info", "--list-sdks", "--list-runtimes"].includes(subcommand)) return "result";
+	if (["test", "format", "format-warning", "style", "lint"].includes(subcommand)) return "diagnostic";
+	if (["build", "run", "publish", "pack", "clean", "restore", "watch"].includes(subcommand)) return "progress";
+	return "passthrough";
+}
+
+function classifySwift(args: string[]): SegmentPolicy {
+	const index = firstCommandIndex(args, new Set(["--package-path", "-Xswiftc", "-Xlinker", "-Xcc"]));
+	const subcommand = args[index]?.toLowerCase();
+	if (!subcommand || ["--version", "-v", "--help", "-h"].includes(subcommand)) return "result";
+	if (["test", "lint"].includes(subcommand)) return "diagnostic";
+	if (["build", "run", "package", "package-plugin", "format"].includes(subcommand)) return "progress";
+	return "passthrough";
+}
+
+function classifyZig(args: string[]): SegmentPolicy {
+	const index = firstCommandIndex(args, new Set(["--cache-dir", "--global-cache-dir", "--pkg-begin", "--pkg-end"]));
+	const subcommand = args[index]?.toLowerCase();
+	if (!subcommand || ["version", "--help", "-h"].includes(subcommand)) return "result";
+	if (["test", "fmt", "check"].includes(subcommand)) return "diagnostic";
+	if (["build", "run", "build-exe", "build-lib", "build-obj", "translate-c"].includes(subcommand)) return "progress";
+	return "passthrough";
+}
+
+function classifyDart(args: string[]): SegmentPolicy {
+	const index = firstCommandIndex(args, new Set(["-p", "--package", "--define", "--dart-define", "-C", "--config"]));
+	const subcommand = args[index]?.toLowerCase();
+	if (!subcommand || ["--version", "-v", "--help", "-h", "doctor"].includes(subcommand)) return "result";
+	// Handle flutter wrapper
+	if (subcommand === "flutter") {
+		const flutterIndex = skipOptions(args.slice(index + 1), 0, new Set(["-p", "--package", "--config"]));
+		const flutterCommand = args[index + 1 + flutterIndex]?.toLowerCase();
+		if (["test", "analyze"].includes(flutterCommand ?? "")) return "diagnostic";
+		if (["build", "run", "pub", "packages", "clean"].includes(flutterCommand ?? "")) return "progress";
+		return "passthrough";
+	}
+	if (["test", "analyze", "format"].includes(subcommand)) return "diagnostic";
+	if (["run", "compile", "build", "pub", "pubspec", "create"].includes(subcommand)) return "progress";
+	return "passthrough";
+}
+
+function classifyKotlin(args: string[]): SegmentPolicy {
+	// ktlint with no args runs linting -> diagnostic
+	if (args.length === 0) return "diagnostic";
+	const index = firstCommandIndex(args, new Set(["-cp", "--classpath", "-d", "--destination", "-include-runtime", "-P", "--plugin"]));
+	const subcommand = args[index]?.toLowerCase();
+	if (!subcommand || ["-version", "--help", "-h"].includes(subcommand)) return "result";
+	// ktlint flags
+	if (args.some(arg => /^--(reporter|format|relative|editorconfig|android|experimental|debug|color|stdin|patterns)/.test(arg) || arg === "--version")) return "result";
+	if (["test", "check"].includes(subcommand) || args.includes("--check")) return "diagnostic";
+	if (["build", "compile", "run", "daemon", "stop"].includes(subcommand)) return "progress";
+	return "passthrough";
+}
+
+function classifyScala(args: string[]): SegmentPolicy {
+	const index = firstCommandIndex(args, new Set(["-java-home", "-Dsbt", "-sbt-version", "-sbt-boot", "-sbt-ivy", "-sbt-cache", "-mem", "-no-colors", "-batch", "-debug"]));
+	const subcommand = args[index]?.toLowerCase();
+	if (!subcommand || ["--version", "-v", "--help", "-h"].includes(subcommand)) return "result";
+	if (["test", "check", "lint", "scalastyle", "scalafmt", "fmt"].includes(subcommand)) return "diagnostic";
+	if (["compile", "build", "run", "package", "publish", "assembly", "clean"].includes(subcommand)) return "progress";
+	return "passthrough";
+}
+
+function classifyElixir(args: string[]): SegmentPolicy {
+	const index = firstCommandIndex(args, new Set(["--pre-import-path", "--no-deps-check", "--no-compile", "--no-archives-check", "--no-mix-exs", "--profile", "--trace", "--verbose", "--app"]));
+	const subcommand = args[index]?.toLowerCase();
+	if (!subcommand || ["--version", "-v", "--help", "-h", "help", "local", "local.hex", "local.rebar"].includes(subcommand)) return "result";
+	if (["test", "deps.unlock", "format", "credo", "dialyzer", "quality"].includes(subcommand)) return "diagnostic";
+	if (["compile", "deps.get", "deps.update", "run", "release", "phx.new", "phx.gen", "phx.digest", "escript.build", "loadpaths"].includes(subcommand)) return "progress";
+	return "passthrough";
+}
+
+function classifyHaskell(args: string[]): SegmentPolicy {
+	// stack
+	const index = firstCommandIndex(args, new Set(["--stack-root", "--stack-yaml", "--skip", "--docker", "--nix", "--system-ghc", "--no-system-ghc", "--install-ghc", "--arch", "--os", "--ghc-options"]));
+	const subcommand = args[index]?.toLowerCase();
+	if (!subcommand || ["--version", "-v", "--help", "-h", "ls", "list", "path", "query", "ide", "config"].includes(subcommand)) return "result";
+	if (["test", "bench", "haddock", "check", "hpc", "cover"].includes(subcommand)) return "diagnostic";
+	if (["build", "install", "run", "exec", "ghci", "repl", "setup", "unpack", "clean", "update"].includes(subcommand)) return "progress";
+	return "passthrough";
+}
+
+function classifyTerraform(args: string[]): SegmentPolicy {
+	const index = firstCommandIndex(args, new Set(["-chdir", "-state", "-state-out", "-backup", "-var-file", "-var", "-target", "-compact-warnings", "-json", "-no-color", "-input", "-lock", "-lock-timeout", "-parallelism", "-refresh", "-replace"]));
+	const subcommand = args[index]?.toLowerCase();
+	if (!subcommand || ["--version", "-v", "--help", "-h", "version", "fmt", "console", "force-unlock", "state", "output", "providers", "metadata"].includes(subcommand)) return "result";
+	if (["validate", "plan"].includes(subcommand)) return "diagnostic";
+	if (["apply", "destroy", "init", "import", "get", "refresh", "workspace", "login", "logout"].includes(subcommand)) return "progress";
+	return "passthrough";
+}
+
+function classifyPoetry(args: string[]): SegmentPolicy {
+	const subcommand = args.find((arg) => !arg.startsWith("-"))?.toLowerCase();
+	if (["check", "lock"].includes(subcommand ?? "")) return "diagnostic";
+	if (["install", "add", "remove", "update", "build", "publish", "new", "init", "shell", "run"].includes(subcommand ?? "")) return "progress";
+	if (["--version", "-V", "--help", "-h"].includes(subcommand ?? "")) return "result";
+	return "passthrough";
+}
+
+function classifyUv(args: string[]): SegmentPolicy {
+	const subcommand = args.find((arg) => !arg.startsWith("-"))?.toLowerCase();
+	if (["lock", "pip-compile", "pip-check"].includes(subcommand ?? "")) return "diagnostic";
+	if (["sync", "venv", "pip-install", "pip-sync", "build", "publish", "add", "remove"].includes(subcommand ?? "")) return "progress";
+	// uv run is a launcher like npx — passthrough
+	if (subcommand === "run") return "passthrough";
+	if (["--version", "-V", "--help", "-h", "python", "tool", "which"].includes(subcommand ?? "")) return "result";
+	return "passthrough";
+}
+
+function classifyTsx(args: string[]): SegmentPolicy {
+	const subcommand = args.find((arg) => !arg.startsWith("-"))?.toLowerCase();
+	if (["test", "typecheck", "check"].includes(subcommand ?? "")) return "diagnostic";
+	if (["build", "run", "dev", "watch"].includes(subcommand ?? "")) return "progress";
+	return "passthrough";
+}
+
+function classifyOxlint(args: string[]): SegmentPolicy {
+	// oxlint is a linter — always diagnostic unless showing version info
+	if (args.includes("--version") || args.includes("-V") || args.includes("--help") || args.includes("-h")) return "result";
+	return "diagnostic";
+}
+
+function classifyJust(args: string[]): SegmentPolicy {
+	const recipe = args.find((arg) => !arg.startsWith("-"));
+	if (!recipe || ["--version", "-v", "--help", "-h", "--list", "--summary", "--dump", "--choose", "--evaluate", "--variables"].some(f => args.includes(f))) return "result";
+	return classifyScript(recipe);
+}
+
+function classifyTask(args: string[]): SegmentPolicy {
+	const subcommand = args.find((arg) => !arg.startsWith("-"))?.toLowerCase();
+	if (!subcommand || ["--version", "-v", "--help", "-h", "--list", "--status", "--summary", "--init", "--env", "--completion"].includes(subcommand)) return "result";
+	return classifyScript(subcommand);
+}
+
 function classifyBuildTool(name: string, args: string[]): SegmentPolicy | undefined {
 	const task = args.filter((arg) => !arg.startsWith("-")).map((arg) => scriptParts(arg));
 	const hasDiagnosticTask = task.some((parts) => parts.some((part) => ["test", "check", "lint", "verify"].includes(part)));
@@ -599,6 +736,24 @@ function classifySegment(words: string[], depth: number): SegmentPolicy {
 	}
 	if (name === "prettier") return args.includes("--check") || args.includes("--list-different") ? "diagnostic" : "passthrough";
 	if (name === "ruff") return args.includes("--check") || args.includes("check") ? "diagnostic" : "passthrough";
+	// New language/tool classifiers
+	if (name === "dotnet") return classifyDotnet(args);
+	if (name === "swift") return classifySwift(args);
+	if (name === "zig") return classifyZig(args);
+	if (name === "dart" || name === "flutter") return classifyDart(args);
+	if (name === "ktlint" || name === "kotlinc") return classifyKotlin(args);
+	if (name === "sbt") return classifyScala(args);
+	if (name === "mix") return classifyElixir(args);
+	if (name === "stack" || name === "cabal") return classifyHaskell(args);
+	if (name === "terraform") return classifyTerraform(args);
+	if (name === "kubectl") return "passthrough";
+	if (name === "ansible-playbook") return "progress";
+	if (name === "poetry") return classifyPoetry(args);
+	if (name === "uv") return classifyUv(args);
+	if (name === "tsx") return classifyTsx(args);
+	if (name === "oxlint") return classifyOxlint(args);
+	if (name === "just") return classifyJust(args);
+	if (name === "task") return classifyTask(args);
 	if (DIAGNOSTIC_COMMANDS.has(name)) return "diagnostic";
 	const buildPolicy = classifyBuildTool(name, args);
 	if (buildPolicy) return buildPolicy;
@@ -626,33 +781,50 @@ export function classifyCommand(command: string): OutputPolicy {
 	return classifyCommandInternal(command, 0);
 }
 
-function compactOutput(text: string): string {
-	const ansiStripped = text.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
+function summarizeOutput(text: string, policy: OutputPolicy, successful: boolean): string {
+	// 1. Strip ANSI escape codes
+	const cleaned = text.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
+	// 2. Single pass: split into lines, handle \r, dedup consecutive
 	const lines: string[] = [];
-	for (const rawLine of ansiStripped.split("\n")) {
-		// Progress indicators commonly redraw the same line with carriage returns.
-		const refreshed = rawLine.split("\r").filter(Boolean).at(-1) ?? "";
-		if (refreshed.trim() || (lines.length > 0 && lines.at(-1)?.trim())) lines.push(refreshed);
+	let prevLine = "";
+	let repeatCount = 0;
+	for (const rawLine of cleaned.split("\n")) {
+		// \r: use lastIndexOf + substring instead of split/filter/at(-1) (saves array allocation)
+		const crIdx = rawLine.lastIndexOf("\r");
+		const refreshed = crIdx >= 0 ? rawLine.slice(crIdx + 1) : rawLine;
+		// Skip empty trailing lines (but keep meaningful blank lines between content)
+		if (lines.length > 0 && !refreshed.trim() && !lines.at(-1)?.trim()) continue;
+		// Dedup consecutive identical lines
+		if (refreshed === prevLine) {
+			repeatCount++;
+			continue;
+		}
+		// Flush previous repeated line if needed
+		if (repeatCount > 1 && prevLine) {
+			lines[lines.length - 1] = `${prevLine} [repeated ${repeatCount} times]`;
+		}
+		repeatCount = 1;
+		prevLine = refreshed;
+		lines.push(refreshed);
 	}
-
-	const compacted: string[] = [];
-	for (let start = 0; start < lines.length;) {
-		let end = start + 1;
-		while (end < lines.length && lines[end] === lines[start]) end++;
-		const line = lines[start]!;
-		compacted.push(end - start > 1 && line ? `${line} [repeated ${end - start} times]` : line);
-		start = end;
+	// Flush trailing repeat
+	if (repeatCount > 1 && prevLine) {
+		lines[lines.length - 1] = `${prevLine} [repeated ${repeatCount} times]`;
 	}
-	return compacted.join("\n");
-}
-
-function summarizeDiagnosticOutput(text: string, policy: OutputPolicy, successful: boolean): string {
-	const lines = text.split("\n").filter((line) => line.trim());
-	if (policy === "passthrough" || policy === "result") return text;
-	const important = lines.filter((line) => /\b(?:error|warning|warn|failed|failure|exception|panic|fatal|passed)\b|(?::\d+(?::\d+)?\s*[-—:]?)/i.test(line));
-	if (!successful) return [...new Set([...important, ...lines.slice(-8)])].join("\n");
-	if (policy === "diagnostic") return important.length > 0 ? [...new Set(important)].join("\n") : "Command completed successfully.";
-	return important.length > 0 ? [...new Set([...important, ...lines.slice(-3)])].join("\n") : lines.slice(-3).join("\n");
+	// 3. If policy is passthrough/result, return all lines joined
+	if (policy === "passthrough" || policy === "result") return lines.join("\n");
+	// 4. Filter to diagnostic-relevant lines
+	const diagnosticRegex = /\b(?:error|warning|warn|failed|failure|exception|panic|fatal|passed|erreur|fehler|errore|erro|errori|fout|virhe|fel|blad|błąd|грешка|viga)\b|(?:\:\d+(?::\d+)?\s*[-—:]?)|(?:\(\d+,\d+\)\s*:)|(?:error\[[A-Z0-9_]+\])|(?:error\s+[A-Z]+\d+)/i;
+	const important = lines.filter((line) => diagnosticRegex.test(line));
+	if (!successful) {
+		return [...new Set([...important, ...lines.slice(-8)])].join("\n");
+	}
+	if (policy === "diagnostic") {
+		return important.length > 0 ? [...new Set(important)].join("\n") : "Command completed successfully.";
+	}
+	return important.length > 0
+		? [...new Set([...important, ...lines.slice(-3)])].join("\n")
+		: lines.slice(-3).join("\n");
 }
 
 class OutputAccumulator {
@@ -866,8 +1038,7 @@ export async function clearBashSessions(): Promise<void> {
 
 function formatOutput(snapshot: OutputSnapshot, command: string, successful: boolean, emptyText = "(no output)"): { text: string; details?: BashToolDetails } {
 	const truncation = snapshot.truncation;
-	const compacted = compactOutput(snapshot.content);
-	let text = summarizeDiagnosticOutput(compacted, classifyCommand(command), successful) || emptyText;
+	let text = summarizeOutput(snapshot.content, classifyCommand(command), successful) || emptyText;
 	const maskedPath = snapshot.fullOutputPath ? maskPath(snapshot.fullOutputPath) : undefined;
 	let details: BashToolDetails | undefined;
 	if (truncation.truncated) {
