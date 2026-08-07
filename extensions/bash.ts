@@ -11,7 +11,7 @@ import { Type, type Static } from "typebox";
 import { executeShell, Shell, type ShellRunResult } from "./omp-native.ts";
 import { randomBytes } from "node:crypto";
 import { createWriteStream } from "node:fs";
-import { realpath, stat } from "node:fs/promises";
+import { realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { toolError } from "./shared.ts";
@@ -52,6 +52,8 @@ const shellSessions = new Map<string, Shell>();
 const shellSessionsInitialized = new Set<string>();
 const shellSessionsInUse = new Set<string>();
 const shellSessionEvictionTimers = new Map<string, ReturnType<typeof setTimeout>>();
+// Full-output temp files created by OutputAccumulator; cleaned up on session_shutdown.
+const tempFilePaths = new Set<string>();
 
 function defaultTempFilePath(prefix: string): string {
 	const id = randomBytes(8).toString("hex");
@@ -976,6 +978,7 @@ class OutputAccumulator {
 	private ensureTempFile(): void {
 		if (this.tempFilePath) return;
 		this.tempFilePath = defaultTempFilePath(this.tempFilePrefix);
+		tempFilePaths.add(this.tempFilePath);
 		this.tempFileStream = createWriteStream(this.tempFilePath, { mode: 0o600 });
 		this.tempFileStream.on("error", (error) => {
 			this.tempFileError ??= error;
@@ -997,6 +1000,15 @@ function getShellSessionIdleMs(): number {
 function getUpdateThrottleMs(): number {
 	const value = Number(process.env.PI_NATIVE_BASH_UPDATE_THROTTLE_MS ?? 75);
 	return Number.isFinite(value) && value >= 0 ? value : 75;
+}
+
+// Internal safety timeout applied when the caller omits `timeout`. Without it, a
+// hung persistent command would never settle, so the `finally` that releases the
+// session (and its in-use claim) would never run, permanently bricking the cwd's
+// session with an unrecoverable `session_busy`.
+function getDefaultTimeoutMs(): number {
+	const value = Number(process.env.PI_NATIVE_BASH_DEFAULT_TIMEOUT_MS ?? 10 * 60_000);
+	return Number.isFinite(value) && value > 0 ? value : 10 * 60_000;
 }
 
 function clearShellSessionEviction(sessionKey: string): void {
@@ -1093,11 +1105,32 @@ export async function executeBashNative(
 			{ cwd: resolvedCwd },
 		);
 	}
-	if (options?.resetSession) await disposeShellSession(sessionKey);
+	// Claim the session key synchronously before any `await` so a concurrent caller
+	// (e.g. one resuming during the resetSession teardown below) cannot also pass the
+	// busy check and end up running on the same Shell. The finally block releases it.
+	if (useSession || options?.resetSession) shellSessionsInUse.add(sessionKey);
+	if (options?.resetSession) {
+		// Inline the teardown instead of calling disposeShellSession: that helper
+		// deletes shellSessionsInUse, briefly re-opening the busy-check window across
+		// its awaited abort. We keep the claim we took above and let the finally below
+		// release it.
+		const oldShell = shellSessions.get(sessionKey);
+		clearShellSessionEviction(sessionKey);
+		shellSessions.delete(sessionKey);
+		shellSessionsInitialized.delete(sessionKey);
+		if (oldShell) await oldShell.abort().catch(() => undefined);
+	}
 
 	let shell = useSession ? shellSessions.get(sessionKey) : undefined;
 	if (!shell && useSession) {
-		shell = new Shell();
+		try {
+			shell = new Shell();
+		} catch (err) {
+			// Construction runs before the main try/finally is in scope; release the
+			// synchronous claim so the key is not permanently marked busy.
+			shellSessionsInUse.delete(sessionKey);
+			throw err;
+		}
 		// Defer registration until after we're past init risks
 	}
 	if (shell) clearShellSessionEviction(sessionKey);
@@ -1153,15 +1186,20 @@ export async function executeBashNative(
 			accumulator.append(chunk);
 			emitUpdate();
 		};
+		// Apply an internal safety timeout when the caller omits `timeout` so a hung
+		// command cannot permanently brick the persistent session (the finally below
+		// only runs once `shell.run` settles).
+		const timeoutMs = timeout ? timeout * 1000 : getDefaultTimeoutMs();
+		const timeoutSeconds = timeoutMs / 1000;
 		const persistentRunOptions = {
 			command,
 			cwd: shellSessionsInitialized.has(sessionKey) ? undefined : resolvedCwd,
-			timeoutMs: timeout ? timeout * 1000 : undefined,
+			timeoutMs,
 			signal: controller.signal,
 		};
 		const runPromise: Promise<ShellRunResult> = shell
 			? shell.run(persistentRunOptions, callback)
-			: executeShell({ command, cwd: resolvedCwd, timeoutMs: timeout ? timeout * 1000 : undefined, signal: controller.signal }, callback);
+			: executeShell({ command, cwd: resolvedCwd, timeoutMs, signal: controller.signal }, callback);
 		let result: ShellRunResult;
 		try {
 			result = await runPromise;
@@ -1191,9 +1229,9 @@ export async function executeBashNative(
 		if (result.timedOut) {
 			throw bashError(
 				"timeout",
-				appendStatus(text, `Command timed out after ${timeout} seconds`),
+				appendStatus(text, `Command timed out after ${timeoutSeconds} seconds`),
 				"Increase timeout or make the command faster before retrying.",
-				{ cwd: resolvedCwd, timeout },
+				{ cwd: resolvedCwd, timeout: timeoutSeconds },
 			);
 		}
 		if ((result.exitCode ?? 0) !== 0) {
@@ -1208,6 +1246,12 @@ export async function executeBashNative(
 	} finally {
 		signal?.removeEventListener("abort", relayAbort);
 		if (pendingUpdateTimer) clearTimeout(pendingUpdateTimer);
+		// Abort a Shell that was constructed but never registered (e.g. an early throw
+		// before `shellSessions.set`). It owns no eviction timer and is absent from the
+		// session map, so the branches below would otherwise leak the underlying process.
+		if (shell && !shellSessions.has(sessionKey)) {
+			void shell.abort().catch(() => undefined);
+		}
 		if (shell) shellSessionsInUse.delete(sessionKey);
 		if (shell && (!sessionReusable || controller.signal.aborted)) {
 			await disposeShellSession(sessionKey);
@@ -1220,6 +1264,12 @@ export async function executeBashNative(
 export function registerBashTool(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", async () => {
 		await clearBashSessions();
+		// Remove truncated-output temp files retained for model readback; by shutdown
+		// the model has already consumed fullOutputPath.
+		await Promise.all(
+			[...tempFilePaths].map((path) => rm(path, { force: true }).catch(() => undefined)),
+		);
+		tempFilePaths.clear();
 	});
 
 	pi.registerTool({
